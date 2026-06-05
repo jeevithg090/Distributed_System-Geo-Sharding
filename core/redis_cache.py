@@ -1,6 +1,7 @@
 # redis_cache.py
 # Redis caching layer for GeoShardDB
 
+# pyrefly: ignore [missing-import]
 import redis
 import json
 import os
@@ -30,7 +31,7 @@ class RedisCache:
             val = self.client.get(full_key)
             if val is not None:
                 self.hits += 1
-                return json.loads(val)
+                return json.loads(val)# Converts the JSON to Python Dictonary 
             self.misses += 1
             return None
         except Exception as e:
