@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: asia-postgres
+
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: asia-postgres
+
+  template:
+
+    metadata:
+      labels:
+        app: asia-postgres
+
+    spec:
+
+      containers:
+
+      - name: postgres
+
+        image: postgres:16
+
+        ports:
+        - containerPort: 5432
+
+        env:
+        - name: POSTGRES_USER
+          value: admin
+
+        - name: POSTGRES_PASSWORD
+          value: password
+
+        - name: POSTGRES_DB
+          value: sharddb
+---
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: asia-postgres-service
+
+spec:
+
+  selector:
+    app: asia-postgres
+
+  ports:
+    - port: 5432
+      targetPort: 5432

@@ -1,0 +1,125 @@
+services:
+  api:
+    build: .
+    container_name: geoshard-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - us-node
+      - eu-node
+      - asia-node
+      - redis
+    networks:
+      - region-net
+
+  us-node:
+    image: postgres:16
+    container_name: us-node
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: sharddb
+    ports:
+      - "5433:5432"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      region-net:
+        ipv4_address: 172.20.0.10
+        aliases:
+          - us-postgres-service
+    volumes:
+      - us_data:/var/lib/postgresql/data
+      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+
+  eu-node:
+    image: postgres:16
+    container_name: eu-node
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: sharddb
+    ports:
+      - "5434:5432"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      region-net:
+        ipv4_address: 172.20.0.11
+        aliases:
+          - eu-postgres-service
+    volumes:
+      - eu_data:/var/lib/postgresql/data
+      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+
+  asia-node:
+    image: postgres:16
+    container_name: asia-node
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: sharddb
+    ports:
+      - "5435:5432"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      region-net:
+        ipv4_address: 172.20.0.12
+        aliases:
+          - asia-postgres-service
+    volumes:
+      - asia_data:/var/lib/postgresql/data
+      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - region-net
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - region-net
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - region-net
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - region-net
+
+networks:
+  region-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  us_data:
+  eu_data:
+  asia_data:

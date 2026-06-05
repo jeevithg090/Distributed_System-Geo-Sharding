@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+psycopg2-binary
+prometheus-fastapi-instrumentator
+faker
+redis
+sentence-transformers
+faiss-cpu
+numpy

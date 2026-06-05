@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.tar
+*.tar.gz
+.env
+
+# SSH keys
+*.pem
+
+# RAG index files
+rag/rag_index.pkl
+rag/*.pkl
+
+# macOS
+.DS_Store
