@@ -11,7 +11,8 @@ GeoShardDB runs three PostgreSQL shards (US, EU, Asia) behind a **FastAPI** gate
 ```mermaid
 flowchart TB
     Client[Client / Benchmarks]
-    API[FastAPI Gateway :8000]
+    LB[NGINX Load Balancer :8000]
+    API[FastAPI Gateway Replicas (3)]
     Redis[(Redis :6379)]
     RAG[RAG Index + Embeddings]
     US[(US Shard :5433)]
@@ -20,7 +21,8 @@ flowchart TB
     Prom[Prometheus :9090]
     Graf[Grafana :3000]
 
-    Client --> API
+    Client --> LB
+    LB --> API
     API --> Redis
     API --> RAG
     API --> US
@@ -32,6 +34,7 @@ flowchart TB
 
 | Layer | Role |
 |-------|------|
+| **Load Balancer** | NGINX round-robin proxy distributing traffic to scaled API gateways |
 | **Shards** | Region-partitioned PostgreSQL 16 nodes; each stores users local to that geography |
 | **Router (API)** | Region-aware reads, cross-shard fan-out, failover via circuit breakers |
 | **Cache** | Redis cache-aside per region (`region:user:{id}`), 5-minute TTL |
