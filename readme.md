@@ -12,7 +12,7 @@ GeoShardDB runs three PostgreSQL shards (US, EU, Asia) behind a **FastAPI** gate
 flowchart TB
     Client[Client / Benchmarks]
     LB[NGINX Load Balancer :8000]
-    API[FastAPI Gateway Replicas (3)]
+    API["FastAPI Gateway Replicas (3)"]
     Redis[(Redis :6379)]
     RAG[RAG Index + Embeddings]
     US[(US Shard :5433)]
