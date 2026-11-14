@@ -1,119 +1,77 @@
-# cache_benchmark.py
-# Benchmark script using built-in urllib to compare database vs. Redis cache latency
+"""Cold (database) vs. warm (Redis) read latency through the running API.
 
-import time
-import urllib.request
-import urllib.error
+Run with ``python -m benchmarks.cache_benchmark``. Uses ``API_URL``
+(default ``http://localhost:8000``) and sends ``ADMIN_API_KEY`` as
+``X-API-Key`` when flushing the cache, if it is set.
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import statistics
 import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any
 
-API_URL = "http://localhost:8000"
+API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
+if not API_URL.startswith(("http://", "https://")):
+    raise SystemExit("API_URL must be an http(s) URL")
 
-def make_request(url, method="GET", data=None):
-    req = urllib.request.Request(url, method=method)
-    if data:
-        req.add_header('Content-Type', 'application/json')
-        jsondata = json.dumps(data).encode('utf-8')
-        req.data = jsondata
+
+def request(path: str, method: str = "GET") -> Any:
+    req = urllib.request.Request(f"{API_URL}{path}", method=method)  # noqa: S310 - scheme checked
+    api_key = os.environ.get("ADMIN_API_KEY")
+    if api_key:
+        req.add_header("X-API-Key", api_key)
     try:
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        print(f"HTTP Error: {e.code} - {e.reason}")
-        return None
-    except Exception as e:
-        print(f"Connection Error: {e}")
-        return None
+        with urllib.request.urlopen(req, timeout=10) as response:  # noqa: S310
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        print(f"HTTP {exc.code} for {method} {path}: {exc.read().decode('utf-8', 'replace')}")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(f"Connection error for {method} {path}: {exc}")
+    return None
 
-def check_api_running():
-    res = make_request(f"{API_URL}/")
-    return res is not None
 
-def run_benchmark():
-    print("==================================================")
-    print("GeoShardDB Redis Caching Benchmark")
-    print("==================================================")
-    
-    # 1. Flush cache first
-    print("Flushing cache...")
-    make_request(f"{API_URL}/cache", method="DELETE")
-        
-    # Get a list of recent users to query
-    print("Fetching recent users for benchmark targets...")
-    res = make_request(f"{API_URL}/users/recent/all")
-    if not res:
-        print("Error: Could not retrieve users. Please ensure FastAPI is running.")
-        sys.exit(1)
-        
-    recent_users = res.get("results", [])
-    if not recent_users:
-        print("No users found in database. Did you run seed_data.py?")
-        sys.exit(1)
-        
-    targets = [u for u in recent_users if "user_id" in u][:5]
-    print(f"Benchmark targets: {[(t['user_id'], t['region']) for t in targets]}")
-    print("--------------------------------------------------")
-    
-    # Measure Cold Reads (Cache Misses -> Postgres DB)
-    print("Running COLD READS (Database query)...")
-    cold_times = []
+def timed_reads(targets: list[dict[str, Any]], label: str) -> list[float]:
+    print(f"{label}:")
+    samples = []
     for target in targets:
-        uid = target["user_id"]
-        reg = target["region"]
-        
-        start = time.time()
-        res = make_request(f"{API_URL}/users/{uid}?region={reg}")
-        end = time.time()
-        
-        latency = (end - start) * 1000
-        cold_times.append(latency)
-        served_from = res.get("served_from_cache", False) if res else False
-        print(f"User {uid} ({reg}): Latency = {latency:.2f} ms | Served from cache: {served_from}")
-        
-    avg_cold = sum(cold_times) / len(cold_times)
-    print(f"Average Cold Read Latency: {avg_cold:.2f} ms")
-    print("--------------------------------------------------")
-    
-    # Measure Warm Reads (Cache Hits -> Redis Cache)
-    print("Running WARM READS (Redis cache query)...")
-    warm_times = []
-    for target in targets:
-        uid = target["user_id"]
-        reg = target["region"]
-        
-        start = time.time()
-        res = make_request(f"{API_URL}/users/{uid}?region={reg}")
-        end = time.time()
-        
-        latency = (end - start) * 1000
-        warm_times.append(latency)
-        served_from = res.get("served_from_cache", False) if res else False
-        print(f"User {uid} ({reg}): Latency = {latency:.2f} ms | Served from cache: {served_from}")
-        
-    avg_warm = sum(warm_times) / len(warm_times)
-    print(f"Average Warm Read Latency: {avg_warm:.2f} ms")
-    print("--------------------------------------------------")
-    
-    # Print Stats
-    speedup = avg_cold / avg_warm if avg_warm > 0 else 0
-    print("BENCHMARK SUMMARY:")
-    print(f"Average Cold Read: {avg_cold:.2f} ms")
-    print(f"Average Warm Read: {avg_warm:.2f} ms")
-    print(f"Cache Speedup Factor: {speedup:.2f}x")
-    
-    # Fetch Cache Stats
-    stats_res = make_request(f"{API_URL}/cache/stats")
-    if stats_res:
-        print("\nRedis Cache Stats:")
-        print(f"  - Hits: {stats_res['stats']['hits']}")
-        print(f"  - Misses: {stats_res['stats']['misses']}")
-        print(f"  - Hit Rate: {stats_res['stats']['hit_rate_pct']}%")
-        print(f"  - Redis Memory: {stats_res['used_memory']}")
-    print("==================================================")
+        start = time.perf_counter()
+        res = request(f"/users/{target['user_id']}?region={target['region']}")
+        latency = (time.perf_counter() - start) * 1000
+        samples.append(latency)
+        cached = res.get("served_from_cache") if res else None
+        print(f"  user {target['user_id']} ({target['region']}): {latency:7.2f} ms  cache={cached}")
+    return samples
+
+
+def main() -> int:
+    if request("/") is None:
+        print(f"GeoShardDB API is not reachable at {API_URL}")
+        return 1
+    request("/cache", method="DELETE")
+    recent = request("/users/recent/all") or {}
+    targets = [u for u in recent.get("results", []) if "user_id" in u][:5]
+    if not targets:
+        print("No users found. Seed the shards first (python seed_data.py).")
+        return 1
+
+    cold = timed_reads(targets, "Cold reads (cache miss -> PostgreSQL)")
+    warm = timed_reads(targets, "Warm reads (cache hit -> Redis)")
+    avg_cold, avg_warm = statistics.fmean(cold), statistics.fmean(warm)
+    print(f"\nAverage cold: {avg_cold:.2f} ms | average warm: {avg_warm:.2f} ms")
+    if avg_warm > 0:
+        print(f"Speed-up: {avg_cold / avg_warm:.2f}x")
+    stats = request("/cache/stats")
+    if stats:
+        s = stats["stats"]
+        print(f"Cache hits={s['hits']} misses={s['misses']} hit_rate={s['hit_rate_pct']}%")
+    return 0
+
 
 if __name__ == "__main__":
-    if not check_api_running():
-        print("Error: GeoShardDB API server is not running on http://localhost:8000")
-        print("Please start the server first.")
-        sys.exit(1)
-    run_benchmark()
+    sys.exit(main())
