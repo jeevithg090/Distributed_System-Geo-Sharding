@@ -1,229 +1,173 @@
-# rag/knowledge_base.py
-# Schema, statistics, and metadata document harvester for RAG
+"""Harvest RAG documents: table schemas, per-shard statistics and system metadata."""
 
-import psycopg2
-import os
+from __future__ import annotations
 
-class Document:
-    def __init__(self, text, metadata):
-        self.text = text
-        self.metadata = metadata # e.g. {"source": "schema", "region": "us", "table": "users"}
+import logging
+from collections.abc import Iterable
+from typing import Any
 
-    def __repr__(self):
-        return f"Document(text={self.text[:50]}..., metadata={self.metadata})"
+from core.config import REGIONS, USER_ID_BLOCK_SIZE, get_settings
+from core.db import shard_cursor
+from rag.vector_store import Document
+
+logger = logging.getLogger(__name__)
+
+TABLES = ("users", "products", "support_tickets", "audit_logs")
+
+
+def _pairs(rows: Iterable[tuple[Any, ...]], fmt: str = "{0}: {1}") -> str:
+    return ", ".join(fmt.format(*row) for row in rows) or "none"
+
 
 class KnowledgeBase:
-    def __init__(self, db_configs):
-        self.db_configs = db_configs # Map of region -> {"host": host, "port": port}
+    def __init__(self, regions: Iterable[str] = REGIONS) -> None:
+        self.regions = tuple(regions)
 
-    def _get_connection(self, region):
-        config = self.db_configs[region]
-        return psycopg2.connect(
-            host=config["host"],
-            port=config["port"],
-            database="sharddb",
-            user="admin",
-            password="password"
-        )
-
-    def harvest_schema_documents(self):
-        """Extracts table schemas from PostgreSQL information_schema"""
-        documents = []
-        tables_to_query = ["users", "products", "support_tickets", "audit_logs"]
-        
-        # We only need to harvest schema from one database because they are identical shards,
-        # but we can label it as the master schema description.
-        region = list(self.db_configs.keys())[0]
+    def harvest_schema_documents(self) -> list[Document]:
+        """Describe each table from ``information_schema`` (shards share one schema)."""
+        documents: list[Document] = []
+        region = self.regions[0]
         try:
-            conn = self._get_connection(region)
-            cursor = conn.cursor()
-            
-            for table in tables_to_query:
-                cursor.execute("""
-                    SELECT column_name, data_type, is_nullable
-                    FROM information_schema.columns
-                    WHERE table_name = %s
-                    ORDER BY ordinal_position;
-                """, (table,))
-                columns = cursor.fetchall()
-                
-                if columns:
-                    col_desc = ", ".join([f"{c[0]} ({c[1]})" for c in columns])
-                    text = f"Database Table Schema for table '{table}': The columns are {col_desc}. This schema is synchronized across all regional database shards (US, EU, ASIA)."
-                    documents.append(Document(
-                        text=text,
-                        metadata={
-                            "source": "schema",
-                            "table": table,
-                            "region": "all"
-                        }
-                    ))
-                    
-            cursor.close()
-            conn.close()
-        except Exception as e:
-            print(f"Error harvesting schemas: {e}")
-            
+            with shard_cursor(region) as cursor:
+                for table in TABLES:
+                    cursor.execute(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name = %s ORDER BY ordinal_position",
+                        (table,),
+                    )
+                    columns = cursor.fetchall()
+                    if not columns:
+                        continue
+                    text = (
+                        f"Database Table Schema for table '{table}': The columns are "
+                        f"{_pairs(columns, '{0} ({1})')}. This schema is identical on every "
+                        f"regional shard ({', '.join(r.upper() for r in self.regions)})."
+                    )
+                    documents.append(Document(text, {"source": "schema", "table": table, "region": "all"}))
+        except Exception as exc:
+            logger.error("Error harvesting schemas from %s: %s", region.upper(), exc)
         return documents
 
-    def harvest_stats_documents(self):
-        """Queries shards to get data aggregates and distributions"""
-        documents = []
-        
-        for region in self.db_configs.keys():
+    def _region_stats(self, region: str) -> list[Document]:
+        r = region.upper()
+        with shard_cursor(region) as cur:
+            cur.execute("SELECT COUNT(*) FROM users WHERE region = %s", (region,))
+            user_count = cur.fetchone()[0]
+            cur.execute(
+                "SELECT subscription_type, COUNT(*) FROM users WHERE region = %s "
+                "GROUP BY subscription_type ORDER BY 1",
+                (region,),
+            )
+            subs = _pairs(cur.fetchall())
+            cur.execute(
+                "SELECT department, COUNT(*) FROM users WHERE region = %s "
+                "GROUP BY department ORDER BY COUNT(*) DESC, department LIMIT 3",
+                (region,),
+            )
+            depts = _pairs(cur.fetchall(), "{0} ({1} users)")
+
+            cur.execute("SELECT COUNT(*) FROM products")
+            prod_count = cur.fetchone()[0]
+            cur.execute("SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY 1")
+            prod_cats = _pairs(cur.fetchall())
+            cur.execute("SELECT name, price_monthly FROM products ORDER BY price_monthly DESC LIMIT 3")
+            top_prods = _pairs(cur.fetchall(), "{0} (${1}/mo)")
+
+            cur.execute("SELECT COUNT(*) FROM support_tickets")
+            ticket_count = cur.fetchone()[0]
+            cur.execute("SELECT category, COUNT(*) FROM support_tickets GROUP BY category ORDER BY 1")
+            ticket_cats = _pairs(cur.fetchall())
+            cur.execute("SELECT priority, COUNT(*) FROM support_tickets GROUP BY priority ORDER BY 1")
+            priorities = _pairs(cur.fetchall(), "{0} priority: {1}")
+            cur.execute("SELECT status, COUNT(*) FROM support_tickets GROUP BY status ORDER BY 1")
+            statuses = _pairs(cur.fetchall(), "{0} tickets: {1}")
+
+            cur.execute("SELECT COUNT(*) FROM audit_logs")
+            log_count = cur.fetchone()[0]
+            cur.execute(
+                "SELECT action, COUNT(*) FROM audit_logs GROUP BY action "
+                "ORDER BY COUNT(*) DESC, action LIMIT 3"
+            )
+            actions = _pairs(cur.fetchall(), "{0} ({1} times)")
+            cur.execute("SELECT success, COUNT(*) FROM audit_logs GROUP BY success ORDER BY 1")
+            outcomes = (
+                ", ".join(f"{'Success' if ok else 'Failure'}: {n}" for ok, n in cur.fetchall()) or "none"
+            )
+
+        return [
+            Document(
+                f"Region {r} Shard User Statistics: Total users = {user_count}. "
+                f"Subscription tiers distribution: {subs}. Top departments: {depts}.",
+                {"source": "stats", "type": "users", "region": region},
+            ),
+            Document(
+                f"Region {r} Shard Product Catalog: Total cloud products = {prod_count}. "
+                f"Categories count: {prod_cats}. Highest priced products in this region: {top_prods}.",
+                {"source": "stats", "type": "products", "region": region},
+            ),
+            Document(
+                f"Region {r} Support Ticket Analytics: Total support tickets = {ticket_count}. "
+                f"Category breakdowns: {ticket_cats}. Priority distributions: {priorities}. "
+                f"Status overview: {statuses}.",
+                {"source": "stats", "type": "tickets", "region": region},
+            ),
+            Document(
+                f"Region {r} Security Audit Log Statistics: Total audit log events = {log_count}. "
+                f"Top actions recorded: {actions}. Status of actions: {outcomes}.",
+                {"source": "stats", "type": "audit_logs", "region": region},
+            ),
+        ]
+
+    def harvest_stats_documents(self) -> list[Document]:
+        documents: list[Document] = []
+        for region in self.regions:
             try:
-                conn = self._get_connection(region)
-                cursor = conn.cursor()
-                
-                # 1. User Counts & Subscription distribution
-                cursor.execute("""
-                    SELECT subscription_type, COUNT(*) 
-                    FROM users 
-                    GROUP BY subscription_type;
-                """)
-                subs = cursor.fetchall()
-                sub_str = ", ".join([f"{row[0]}: {row[1]}" for row in subs])
-                
-                cursor.execute("SELECT COUNT(*) FROM users;")
-                user_count = cursor.fetchone()[0]
-                
-                cursor.execute("""
-                    SELECT department, COUNT(*) 
-                    FROM users 
-                    GROUP BY department 
-                    ORDER BY COUNT(*) DESC LIMIT 3;
-                """)
-                depts = cursor.fetchall()
-                dept_str = ", ".join([f"{row[0]} ({row[1]} users)" for row in depts])
-                
-                text_users = (f"Region {region.upper()} Shard User Statistics: "
-                              f"Total users = {user_count}. "
-                              f"Subscription tiers distribution: {sub_str}. "
-                              f"Top departments: {dept_str}.")
-                documents.append(Document(
-                    text=text_users,
-                    metadata={"source": "stats", "type": "users", "region": region}
-                ))
-                
-                # 2. Product stats
-                cursor.execute("SELECT COUNT(*) FROM products;")
-                prod_count = cursor.fetchone()[0]
-                cursor.execute("SELECT category, COUNT(*) FROM products GROUP BY category;")
-                categories = cursor.fetchall()
-                cat_str = ", ".join([f"{row[0]}: {row[1]}" for row in categories])
-                
-                cursor.execute("SELECT name, price_monthly FROM products ORDER BY price_monthly DESC LIMIT 3;")
-                exp_prods = cursor.fetchall()
-                exp_str = ", ".join([f"{row[0]} (${row[1]}/mo)" for row in exp_prods])
-                
-                text_prods = (f"Region {region.upper()} Shard Product Catalog: "
-                              f"Total cloud products = {prod_count}. "
-                              f"Categories count: {cat_str}. "
-                              f"Highest priced products in this region: {exp_str}.")
-                documents.append(Document(
-                    text=text_prods,
-                    metadata={"source": "stats", "type": "products", "region": region}
-                ))
-                
-                # 3. Support Tickets stats
-                cursor.execute("SELECT COUNT(*) FROM support_tickets;")
-                t_count = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT priority, COUNT(*) FROM support_tickets GROUP BY priority;")
-                priorities = cursor.fetchall()
-                prio_str = ", ".join([f"{row[0]} priority: {row[1]}" for row in priorities])
-                
-                cursor.execute("SELECT category, COUNT(*) FROM support_tickets GROUP BY category;")
-                t_cats = cursor.fetchall()
-                t_cat_str = ", ".join([f"{row[0]}: {row[1]}" for row in t_cats])
-                
-                cursor.execute("SELECT status, COUNT(*) FROM support_tickets GROUP BY status;")
-                statuses = cursor.fetchall()
-                stat_str = ", ".join([f"{row[0]} tickets: {row[1]}" for row in statuses])
-                
-                text_tickets = (f"Region {region.upper()} Support Ticket Analytics: "
-                                f"Total support tickets = {t_count}. "
-                                f"Category breakdowns: {t_cat_str}. "
-                                f"Priority distributions: {prio_str}. "
-                                f"Status overview: {stat_str}.")
-                documents.append(Document(
-                    text=text_tickets,
-                    metadata={"source": "stats", "type": "tickets", "region": region}
-                ))
-                
-                # 4. Audit Log analytics
-                cursor.execute("SELECT COUNT(*) FROM audit_logs;")
-                l_count = cursor.fetchone()[0]
-                cursor.execute("SELECT action, COUNT(*) FROM audit_logs GROUP BY action ORDER BY COUNT(*) DESC LIMIT 3;")
-                acts = cursor.fetchall()
-                act_str = ", ".join([f"{row[0]} ({row[1]} times)" for row in acts])
-                
-                cursor.execute("SELECT success, COUNT(*) FROM audit_logs GROUP BY success;")
-                succs = cursor.fetchall()
-                succ_str = ", ".join([f"{'Success' if row[0] else 'Failure'}: {row[1]}" for row in succs])
-                
-                text_logs = (f"Region {region.upper()} Security Audit Log Statistics: "
-                             f"Total audit log events = {l_count}. "
-                             f"Top actions recorded: {act_str}. "
-                             f"Status of actions: {succ_str}.")
-                documents.append(Document(
-                    text=text_logs,
-                    metadata={"source": "stats", "type": "audit_logs", "region": region}
-                ))
-                
-                cursor.close()
-                conn.close()
-            except Exception as e:
-                print(f"Error harvesting stats for region {region}: {e}")
-                
+                documents.extend(self._region_stats(region))
+            except Exception as exc:
+                logger.error("Error harvesting stats for %s: %s", region.upper(), exc)
         return documents
 
-    def harvest_metadata_documents(self):
-        """Compiles system configuration and replication rules metadata"""
-        documents = []
-        
-        # System replication details
-        replication_text = (
-            "System Replication Metadata: GeoShardDB uses asynchronous eventually consistent replication. "
-            "A background replication worker running on a 10-second loop polls database shards for users "
-            "with replicated=FALSE, and copies them to the other two shards using ON CONFLICT (email) DO NOTHING. "
-            "Replication is multi-directional: US replicates to EU and ASIA, EU replicates to US and ASIA, and ASIA replicates to US and EU."
-        )
-        documents.append(Document(
-            text=replication_text,
-            metadata={"source": "system", "type": "replication", "region": "all"}
-        ))
-        
-        # System routing & network latency rules
-        routing_text = (
-            "System Routing and Latency Metadata: Incoming client user requests are routed by preferred region. "
-            "There is a circuit breaker mechanism monitoring failures for each region (US, EU, ASIA). "
-            "If failures exceed 3, the circuit breaker opens for 15 seconds, and requests failover to "
-            "an alternative available shard. Simulated latencies are: US-EU (80ms), EU-ASIA (120ms), and US-ASIA (160ms)."
-        )
-        documents.append(Document(
-            text=routing_text,
-            metadata={"source": "system", "type": "routing", "region": "all"}
-        ))
-        
-        # Caching config
-        cache_text = (
-            "System Caching Layer Metadata: A distributed Redis cache sits in front of the PostgreSQL shards. "
-            "The cache utilizes a Cache-Aside pattern where user reads hit Redis first. "
-            "On cache misses, the PostgreSQL shard is queried, and the result is stored in Redis with a 300-second TTL. "
-            "Cache keys are stored in the format '{region}:user:{user_id}'."
-        )
-        documents.append(Document(
-            text=cache_text,
-            metadata={"source": "system", "type": "cache", "region": "all"}
-        ))
-        
-        return documents
+    def harvest_metadata_documents(self) -> list[Document]:
+        """Static documents describing how the system itself behaves."""
+        settings = get_settings()
+        block = f"{USER_ID_BLOCK_SIZE:,}"
+        texts = {
+            "sharding": (
+                "System Sharding Metadata: GeoShardDB partitions users geographically into three "
+                "PostgreSQL shards: US, EU and ASIA. Each user lives on the shard of their home region. "
+                f"Every region owns a disjoint block of {block} user IDs (US starts at 1, EU at "
+                f"{USER_ID_BLOCK_SIZE + 1:,}, ASIA at {2 * USER_ID_BLOCK_SIZE + 1:,}), so the home shard "
+                "can be derived from a user ID and replicas keep the same ID on every shard."
+            ),
+            "replication": (
+                "System Replication Metadata: GeoShardDB uses asynchronous, eventually consistent "
+                "replication. A background replication worker polls each shard every 10 seconds for "
+                "users with replicated = FALSE and copies them, with their global user_id, to the other "
+                "two shards using ON CONFLICT DO NOTHING. Rows are marked replicated only after every "
+                "target shard accepted them. Replication is multi-directional between US, EU and ASIA."
+            ),
+            "routing": (
+                "System Routing and Failover Metadata: Requests are routed to the user's home region. "
+                "Each region has a circuit breaker. After "
+                f"{settings.breaker_failure_threshold} consecutive failures the breaker opens for "
+                f"{int(settings.breaker_recovery_timeout)} seconds and reads fail over to a healthy "
+                "region's replica; then a half-open trial request decides whether it closes again."
+            ),
+            "cache": (
+                "System Caching Layer Metadata: A Redis cache sits in front of the PostgreSQL shards "
+                "using the cache-aside pattern. User reads check Redis first; on a miss the shard is "
+                f"queried and the result stored in Redis with a {settings.cache_ttl_seconds}-second TTL. "
+                "Cache keys use the format '{region}:user:{user_id}'."
+            ),
+        }
+        return [
+            Document(text, {"source": "system", "type": kind, "region": "all"})
+            for kind, text in texts.items()
+        ]
 
-    def harvest_all(self):
-        """Harvests all document sources"""
-        docs = []
-        docs.extend(self.harvest_schema_documents())
-        docs.extend(self.harvest_stats_documents())
-        docs.extend(self.harvest_metadata_documents())
-        return docs
+    def harvest_all(self) -> list[Document]:
+        return (
+            self.harvest_schema_documents()
+            + self.harvest_stats_documents()
+            + self.harvest_metadata_documents()
+        )

@@ -1,127 +1,128 @@
-# rag/vector_store.py
-# FAISS-based Vector Store with numpy-based cosine similarity fallback
+"""In-memory vector store using FAISS when available and NumPy otherwise.
 
+Vectors are L2-normalised, so inner product equals cosine similarity. The index
+is persisted as JSON (documents, vectors and the embedding backend that
+produced them); it is never unpickled, so loading an index cannot execute code.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
 import os
-import pickle
+from dataclasses import dataclass, field
+from typing import Any
+
 import numpy as np
 
 try:
     import faiss
+
     FAISS_AVAILABLE = True
-except ImportError:
+except ImportError:  # optional dependency
+    faiss = None  # type: ignore[assignment]
     FAISS_AVAILABLE = False
-    print("Warning: faiss-cpu not installed. RAG features will run with fallback NumPy vector store.")
+
+logger = logging.getLogger(__name__)
+
+INDEX_FORMAT_VERSION = 2
+
+
+@dataclass
+class Document:
+    text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _normalise(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (vectors / norms).astype(np.float32)
+
 
 class VectorStore:
-    def __init__(self, dimension=384):
+    def __init__(self, dimension: int = 384, use_faiss: bool | None = None) -> None:
         self.dimension = dimension
-        self.documents = []
-        self.vectors = []
-        self.index = None
-        self._init_index()
+        self.use_faiss = FAISS_AVAILABLE if use_faiss is None else (use_faiss and FAISS_AVAILABLE)
+        self.embedding_backend: str | None = None
+        self.documents: list[Document] = []
+        self._vectors = np.zeros((0, dimension), dtype=np.float32)
+        self._index: Any = None
+        self._reset_index()
 
-    def _init_index(self):
-        if FAISS_AVAILABLE:
-            # L2 distance index (FAISS doesn't directly support Cosine without IP index on normalized vectors)
-            # We will normalize vectors upon adding and querying to make IndexFlatIP act as Cosine Similarity
-            self.index = faiss.IndexFlatIP(self.dimension)
-        else:
-            self.index = None
+    def _reset_index(self) -> None:
+        self._index = faiss.IndexFlatIP(self.dimension) if self.use_faiss else None
 
-    def add_documents(self, docs, vecs):
-        """Adds documents and their corresponding embedding vectors to the index"""
-        assert len(docs) == len(vecs), "Documents and vectors size mismatch"
+    def __len__(self) -> int:
+        return len(self.documents)
+
+    def add_documents(self, docs: list[Document], vectors: list[list[float]]) -> None:
+        if len(docs) != len(vectors):
+            raise ValueError("documents and vectors must have the same length")
         if not docs:
             return
-
-        # Normalize vectors for Cosine Similarity
-        normalized_vecs = []
-        for v in vecs:
-            arr = np.array(v, dtype='float32')
-            norm = np.linalg.norm(arr)
-            if norm > 0:
-                arr = arr / norm
-            normalized_vecs.append(arr.tolist())
-
+        arr = np.asarray(vectors, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != self.dimension:
+            raise ValueError(f"expected vectors of dimension {self.dimension}, got {arr.shape}")
+        arr = _normalise(arr)
         self.documents.extend(docs)
-        self.vectors.extend(normalized_vecs)
+        self._vectors = np.vstack([self._vectors, arr])
+        if self._index is not None:
+            self._index.add(arr)
 
-        if FAISS_AVAILABLE and self.index:
-            np_vecs = np.array(normalized_vecs, dtype='float32')
-            self.index.add(np_vecs)
-
-    def search(self, query_vector, top_k=5):
-        """Searches top_k closest documents to the query vector"""
-        if not self.documents:
+    def search(self, query_vector: list[float], top_k: int = 5) -> list[dict[str, Any]]:
+        if not self.documents or top_k < 1:
             return []
-
-        # Normalize query vector
-        q_arr = np.array(query_vector, dtype='float32')
-        q_norm = np.linalg.norm(q_arr)
-        if q_norm > 0:
-            q_arr = q_arr / q_norm
-
+        query = _normalise(np.asarray([query_vector], dtype=np.float32))
         top_k = min(top_k, len(self.documents))
-
-        if FAISS_AVAILABLE and self.index:
-            # Query vector shape needs to be (1, dim)
-            q_np = np.array([q_arr], dtype='float32')
-            similarities, indices = self.index.search(q_np, top_k)
-            
-            results = []
-            for sim, idx in zip(similarities[0], indices[0]):
-                if idx != -1 and idx < len(self.documents):
-                    results.append({
-                        "document": self.documents[idx],
-                        "similarity": float(sim) # FlatIP on normalized vectors gives cosine similarity [-1, 1]
-                    })
-            return results
+        if self._index is not None:
+            scores, indices = self._index.search(query, top_k)
+            pairs = [(int(i), float(s)) for i, s in zip(indices[0], scores[0], strict=True) if i != -1]
         else:
-            # Fallback Cosine Similarity using NumPy
-            np_vectors = np.array(self.vectors, dtype='float32')
-            # Cosine similarity is dot product of normalized vectors
-            similarities = np.dot(np_vectors, q_arr)
-            
-            # Get top_k indices sorted descending by similarity
-            top_indices = np.argsort(similarities)[::-1][:top_k]
-            
-            results = []
-            for idx in top_indices:
-                results.append({
-                    "document": self.documents[idx],
-                    "similarity": float(similarities[idx])
-                })
-            return results
+            sims = self._vectors @ query[0]
+            order = np.argsort(-sims, kind="stable")[:top_k]
+            pairs = [(int(i), float(sims[i])) for i in order]
+        return [{"document": self.documents[i], "similarity": s} for i, s in pairs]
 
-    def save(self, filepath):
-        """Saves index and document list to disk"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        data = {
-            "documents": self.documents,
-            "vectors": self.vectors,
-            "dimension": self.dimension
+    def save(self, filepath: str) -> None:
+        directory = os.path.dirname(filepath)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload = {
+            "format_version": INDEX_FORMAT_VERSION,
+            "dimension": self.dimension,
+            "embedding_backend": self.embedding_backend,
+            "documents": [{"text": d.text, "metadata": d.metadata} for d in self.documents],
+            "vectors": self._vectors.round(6).tolist(),
         }
-        with open(filepath, "wb") as f:
-            pickle.dump(data, f)
-        print(f"Saved vector store with {len(self.documents)} documents to {filepath}")
+        tmp_path = f"{filepath}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp_path, filepath)  # atomic swap so readers never see a partial file
+        logger.info("Saved vector store with %d documents to %s", len(self), filepath)
 
-    def load(self, filepath):
-        """Loads index and document list from disk"""
+    def load(self, filepath: str) -> bool:
         if not os.path.exists(filepath):
-            print(f"No vector store index found at {filepath}")
+            logger.info("No vector store index found at %s", filepath)
             return False
-            
-        with open(filepath, "rb") as f:
-            data = pickle.load(f)
-            
-        self.documents = data["documents"]
-        self.vectors = data["vectors"]
-        self.dimension = data["dimension"]
-        self._init_index()
+        try:
+            with open(filepath, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if payload.get("format_version") != INDEX_FORMAT_VERSION:
+                logger.warning("Ignoring index %s with unsupported format", filepath)
+                return False
+            dimension = int(payload["dimension"])
+            documents = [Document(d["text"], d.get("metadata", {})) for d in payload["documents"]]
+            vectors = payload["vectors"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.warning("Failed to load index %s: %s", filepath, exc)
+            return False
 
-        if FAISS_AVAILABLE and self.index and self.vectors:
-            np_vecs = np.array(self.vectors, dtype='float32')
-            self.index.add(np_vecs)
-            
-        print(f"Loaded vector store with {len(self.documents)} documents from {filepath}")
+        self.dimension = dimension
+        self.embedding_backend = payload.get("embedding_backend")
+        self.documents = []
+        self._vectors = np.zeros((0, dimension), dtype=np.float32)
+        self._reset_index()
+        self.add_documents(documents, vectors)
+        logger.info("Loaded vector store with %d documents from %s", len(self), filepath)
         return True

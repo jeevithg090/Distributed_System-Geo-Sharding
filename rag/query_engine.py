@@ -1,78 +1,113 @@
-# rag/query_engine.py
-# Retrieval-only Query Engine for GeoShardDB RAG
+"""Retrieval-only question answering over the GeoShardDB knowledge index."""
 
+from __future__ import annotations
+
+import logging
 import os
-import sys
-
-# Ensure parent directory is in python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import threading
+from typing import Any
 
 from rag.embeddings import EmbeddingEngine
-from rag.vector_store import VectorStore
+from rag.vector_store import FAISS_AVAILABLE, VectorStore
 
-INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_index.pkl")
+logger = logging.getLogger(__name__)
+
+LOW_CONFIDENCE_THRESHOLD = 0.2
+
 
 class RAGQueryEngine:
-    def __init__(self):
-        self.engine = EmbeddingEngine()
-        self.store = VectorStore()
-        self.index_loaded = self.store.load(INDEX_FILE)
+    """Loads the on-disk index lazily and reloads it whenever the file changes.
 
-    def reload_index(self):
-        self.index_loaded = self.store.load(INDEX_FILE)
+    Reloading on modification time means an index rebuilt by any API replica
+    (on a shared volume) or by ``python -m rag.indexer`` is picked up without
+    restarting the server.
+    """
+
+    def __init__(self, engine: EmbeddingEngine, index_path: str) -> None:
+        self.engine = engine
+        self.index_path = index_path
+        self.store = VectorStore()
+        self._loaded_mtime: float | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def index_loaded(self) -> bool:
+        return self._loaded_mtime is not None
+
+    def refresh(self) -> bool:
+        """(Re)load the index if the file is new or changed. Returns whether one is loaded."""
+        try:
+            mtime = os.path.getmtime(self.index_path)
+        except OSError:
+            return self.index_loaded
+        with self._lock:
+            if mtime != self._loaded_mtime:
+                store = VectorStore()
+                if store.load(self.index_path):
+                    self.store = store
+                    self._loaded_mtime = mtime
         return self.index_loaded
 
-    def ask(self, question, top_k=3):
-        if not self.index_loaded:
-            # Try reloading in case it was built since initialization
-            if not self.reload_index():
-                return {
-                    "question": question,
-                    "answer": "Error: RAG index is not initialized. Please build the index first using /rag/index endpoint or running 'python rag/indexer.py'.",
-                    "retrieved_documents": []
-                }
+    def status(self) -> dict[str, Any]:
+        loaded = self.refresh()
+        return {
+            "index_initialized": loaded,
+            "document_count": len(self.store) if loaded else 0,
+            "index_file_path": self.index_path,
+            "index_embedding_backend": self.store.embedding_backend if loaded else None,
+            "configured_embedding_backend": self.engine.requested_backend,
+            "vector_search": "faiss" if FAISS_AVAILABLE else "numpy",
+        }
 
-        # 1. Embed question
-        q_vector = self.engine.embed_text(question)
-        
-        # 2. Vector search
-        results = self.store.search(q_vector, top_k=top_k)
-        
-        # 3. Construct a synthesized answer based on retrieved documents
-        if not results:
+    def ask(self, question: str, top_k: int = 3) -> dict[str, Any]:
+        if not self.refresh():
             return {
                 "question": question,
-                "answer": "No relevant database metadata or stats documents were retrieved to answer your question.",
-                "retrieved_documents": []
+                "answer": (
+                    "The RAG index is not initialized. Build it with POST /rag/index "
+                    "or `python -m rag.indexer`."
+                ),
+                "retrieved_documents": [],
+                "index_initialized": False,
             }
-            
-        # Synthesize direct answer based on the best matched document
-        best_match = results[0]["document"]
-        similarity = results[0]["similarity"]
-        
-        # Intelligent direct response template-synthesizer based on similarity
-        if similarity < 0.2:
-            answer = "I found some database records, but their relevance is quite low. Here is what I retrieved:"
-        else:
-            answer = f"Based on retrieved system metadata and database statistics (Confidence: {similarity * 100:.1f}%):\n\n"
-            # Extract key statements
-            sentences = []
-            for r in results:
-                doc = r["document"]
-                sentences.append(doc.text)
-            answer += "\n".join([f"- {s}" for s in sentences])
-            
-        retrieved_docs_formatted = []
-        for r in results:
-            doc = r["document"]
-            retrieved_docs_formatted.append({
-                "text": doc.text,
-                "similarity_score": round(r["similarity"], 4),
-                "metadata": doc.metadata
-            })
 
+        if self.store.embedding_backend and self.store.embedding_backend != self.engine.backend:
+            return {
+                "question": question,
+                "answer": (
+                    f"The index was built with '{self.store.embedding_backend}' embeddings but the "
+                    f"server is using '{self.engine.backend}'. Rebuild the index with POST /rag/index."
+                ),
+                "retrieved_documents": [],
+                "index_initialized": True,
+            }
+
+        results = self.store.search(self.engine.embed_text(question), top_k=top_k)
+        retrieved = [
+            {
+                "text": r["document"].text,
+                "similarity_score": round(r["similarity"], 4),
+                "metadata": r["document"].metadata,
+            }
+            for r in results
+        ]
+        if not results:
+            answer = "No relevant documents were retrieved to answer your question."
+        elif results[0]["similarity"] < LOW_CONFIDENCE_THRESHOLD:
+            answer = (
+                "No document matched your question closely; the nearest (low-relevance) "
+                "documents are listed in retrieved_documents."
+            )
+        else:
+            confidence = results[0]["similarity"] * 100
+            bullets = "\n".join(f"- {r['document'].text}" for r in results)
+            answer = (
+                f"Based on retrieved system metadata and database statistics "
+                f"(top similarity: {confidence:.1f}%):\n\n{bullets}"
+            )
         return {
             "question": question,
             "answer": answer,
-            "retrieved_documents": retrieved_docs_formatted
+            "retrieved_documents": retrieved,
+            "index_initialized": True,
         }
