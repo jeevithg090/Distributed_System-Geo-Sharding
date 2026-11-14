@@ -1,39 +1,34 @@
-# os_concepts/memory_benchmark.py
-# Benchmark comparing cache page replacement (eviction) algorithms
+"""Compare cache page-replacement algorithms on a fixed access trace.
 
-from page_replacement import CacheSimulator
+Run with ``python -m os_concepts.memory_benchmark``.
+"""
 
-def run_benchmark():
-    print("==================================================")
+from __future__ import annotations
+
+from os_concepts.page_replacement import ALGORITHMS, CacheSimulator
+
+TRACE = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5, 6, 1, 2, 3, 7, 8, 9, 1, 2, 3]
+CAPACITY = 4
+
+
+def run_benchmark() -> None:
+    print("=" * 57)
     print("Cache Eviction / Page Replacement Benchmark")
-    print("==================================================")
-    
-    # Access trace simulating realistic caching hits/misses
-    trace = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5, 6, 1, 2, 3, 7, 8, 9, 1, 2, 3]
-    capacity = 4
-    
-    print(f"Trace size: {len(trace)} accesses")
-    print(f"Cache capacity: {capacity} items")
-    print(f"Trace: {trace}")
-    print("--------------------------------------------------")
-    
-    sim = CacheSimulator(capacity)
-    algorithms = ["FIFO", "LRU", "LFU", "Clock", "Optimal"]
-    results = {}
-    
-    results["FIFO"] = sim.simulate_fifo(trace)
-    results["LRU"] = sim.simulate_lru(trace)
-    results["LFU"] = sim.simulate_lfu(trace)
-    results["Clock"] = sim.simulate_clock(trace)
-    results["Optimal"] = sim.simulate_optimal(trace)
-    
-    # Print comparison table
+    print("=" * 57)
+    print(f"Trace ({len(TRACE)} accesses): {TRACE}")
+    print(f"Cache capacity: {CAPACITY}")
+    print("-" * 57)
     print(f"{'Algorithm':<12} | {'Hits':<8} | {'Faults':<8} | {'Hit Rate %':<12} | {'Evictions':<10}")
     print("-" * 57)
-    for alg in algorithms:
-        res = results[alg]
-        print(f"{alg:<12} | {res['hits']:<8} | {res['faults']:<8} | {res['hit_rate_pct']:<12.2f} | {res['evictions_count']:<10}")
-    print("==================================================")
+    sim = CacheSimulator(CAPACITY)
+    for name in ALGORITHMS:
+        res = sim.simulate(name, TRACE)
+        print(
+            f"{res['algorithm']:<12} | {res['hits']:<8} | {res['faults']:<8} | "
+            f"{res['hit_rate_pct']:<12.2f} | {res['evictions_count']:<10}"
+        )
+    print("=" * 57)
+
 
 if __name__ == "__main__":
     run_benchmark()
