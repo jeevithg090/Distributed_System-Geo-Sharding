@@ -1,136 +1,182 @@
+# GeoShardDB local stack. Copy .env.example to .env first:
+#   cp .env.example .env && docker compose up -d --build
+
+x-shard: &shard
+  image: postgres:16
+  environment:
+    POSTGRES_USER: ${POSTGRES_USER:-admin}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    POSTGRES_DB: ${POSTGRES_DB:-sharddb}
+  cap_add:
+    - NET_ADMIN # lets you add `tc netem` delay to simulate inter-region latency
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+  restart: unless-stopped
+
+x-app-env: &app-env
+  POSTGRES_USER: ${POSTGRES_USER:-admin}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  POSTGRES_DB: ${POSTGRES_DB:-sharddb}
+  SHARD_US_HOST: us-postgres-service
+  SHARD_US_PORT: "5432"
+  SHARD_EU_HOST: eu-postgres-service
+  SHARD_EU_PORT: "5432"
+  SHARD_ASIA_HOST: asia-postgres-service
+  SHARD_ASIA_PORT: "5432"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+  BREAKER_FAILURE_THRESHOLD: ${BREAKER_FAILURE_THRESHOLD:-3}
+  BREAKER_RECOVERY_TIMEOUT: ${BREAKER_RECOVERY_TIMEOUT:-15}
+  CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+  RAG_EMBEDDING_BACKEND: ${RAG_EMBEDDING_BACKEND:-auto}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-app-depends: &app-depends
+  us-node:
+    condition: service_healthy
+  eu-node:
+    condition: service_healthy
+  asia-node:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_RAG: ${INSTALL_RAG:-true}
+    image: geoshard-api:latest
     deploy:
       replicas: 3
+    environment: *app-env
+    volumes:
+      - rag_data:/app/data # shared so an index rebuilt by one replica is seen by all
+    depends_on: *app-depends
+    networks: [region-net]
+    restart: unless-stopped
+
+  replication-worker:
+    image: geoshard-api:latest
+    command: ["python", "-m", "core.replication_worker", "--interval", "10"]
+    environment: *app-env
+    healthcheck:
+      disable: true
     depends_on:
-      - us-node
-      - eu-node
-      - asia-node
-      - redis
-    networks:
-      - region-net
+      <<: *app-depends
+      api:
+        condition: service_started # the api service builds the shared image
+    networks: [region-net]
+    restart: unless-stopped
 
   load-balancer:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     container_name: geoshard-lb
     ports:
       - "8000:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - api
-    networks:
-      - region-net
+      api:
+        condition: service_healthy
+    networks: [region-net]
+    restart: unless-stopped
 
   us-node:
-    image: postgres:16
+    <<: *shard
     container_name: us-node
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: sharddb
     ports:
-      - "5433:5432"
-    cap_add:
-      - NET_ADMIN
+      - "127.0.0.1:5433:5432"
     networks:
       region-net:
-        ipv4_address: 172.20.0.10
-        aliases:
-          - us-postgres-service
+        aliases: [us-postgres-service]
     volumes:
       - us_data:/var/lib/postgresql/data
-      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+      - ./db/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
 
   eu-node:
-    image: postgres:16
+    <<: *shard
     container_name: eu-node
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: sharddb
     ports:
-      - "5434:5432"
-    cap_add:
-      - NET_ADMIN
+      - "127.0.0.1:5434:5432"
     networks:
       region-net:
-        ipv4_address: 172.20.0.11
-        aliases:
-          - eu-postgres-service
+        aliases: [eu-postgres-service]
     volumes:
       - eu_data:/var/lib/postgresql/data
-      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+      - ./db/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
 
   asia-node:
-    image: postgres:16
+    <<: *shard
     container_name: asia-node
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: sharddb
     ports:
-      - "5435:5432"
-    cap_add:
-      - NET_ADMIN
+      - "127.0.0.1:5435:5432"
     networks:
       region-net:
-        ipv4_address: 172.20.0.12
-        aliases:
-          - asia-postgres-service
+        aliases: [asia-postgres-service]
     volumes:
       - asia_data:/var/lib/postgresql/data
-      - ./init_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql
+      - ./db/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
 
   redis:
     image: redis:7-alpine
     container_name: redis
     ports:
-      - "6379:6379"
-    networks:
-      - region-net
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [region-net]
+    restart: unless-stopped
 
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: redis-commander
+    profiles: [tools] # opt in: docker compose --profile tools up -d
     environment:
       - REDIS_HOSTS=local:redis:6379
     ports:
-      - "8081:8081"
-    depends_on:
-      - redis
-    networks:
-      - region-net
+      - "127.0.0.1:8081:8081"
+    depends_on: [redis]
+    networks: [region-net]
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v3.0.0
     container_name: prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - region-net
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks: [region-net]
+    restart: unless-stopped
 
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:11.3.0
     container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
     ports:
-      - "3000:3000"
-    networks:
-      - region-net
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on: [prometheus]
+    networks: [region-net]
+    restart: unless-stopped
 
 networks:
   region-net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
 
 volumes:
   us_data:
   eu_data:
   asia_data:
+  rag_data:

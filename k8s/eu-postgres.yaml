@@ -1,54 +1,58 @@
+# EU shard. Requires the "geoshard-db" Secret (see README: Kubernetes) and
+# the "geoshard-schema" ConfigMap created from db/init_schema.sql.
 apiVersion: apps/v1
 kind: Deployment
-
 metadata:
   name: eu-postgres
-
+  labels:
+    app: eu-postgres
 spec:
   replicas: 1
-
   selector:
     matchLabels:
       app: eu-postgres
-
   template:
-
     metadata:
       labels:
         app: eu-postgres
-
     spec:
-
       containers:
-
-      - name: postgres
-
-        image: postgres:16
-
-        ports:
-        - containerPort: 5432
-
-        env:
-        - name: POSTGRES_USER
-          value: admin
-
-        - name: POSTGRES_PASSWORD
-          value: password
-
-        - name: POSTGRES_DB
-          value: sharddb
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: {name: geoshard-db, key: POSTGRES_USER}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: geoshard-db, key: POSTGRES_PASSWORD}
+            - name: POSTGRES_DB
+              value: sharddb
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d sharddb"]
+            periodSeconds: 5
+          volumeMounts:
+            - name: schema
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+      volumes:
+        - name: schema
+          configMap:
+            name: geoshard-schema
 ---
 apiVersion: v1
 kind: Service
-
 metadata:
   name: eu-postgres-service
-
 spec:
-
   selector:
     app: eu-postgres
-
   ports:
     - port: 5432
       targetPort: 5432
