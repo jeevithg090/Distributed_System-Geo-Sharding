@@ -21,8 +21,12 @@ from typing import Annotated, Any
 
 import redis
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core import users as user_store
 from core.circuit_breaker import BreakerRegistry
@@ -47,6 +51,7 @@ API_VERSION = "2.1.0"
 SEMAPHORE_LIMIT = 3
 MAX_CONSUMERS = 8
 DEFAULT_PAGE_TRACE = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 
 class Region(StrEnum):
@@ -148,8 +153,38 @@ def create_app(
         lifespan=lifespan,
     )
     Instrumentator().instrument(app).expose(app, include_in_schema=False)
+    _register_console(app)
     _register_routes(app)
     return app
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "")
+
+
+def _register_console(app: FastAPI) -> None:
+    """Serve the browser console (``web/``) at ``/console`` and a friendly HTML 404."""
+    app.mount("/console/assets", StaticFiles(directory=WEB_DIR), name="console-assets")
+
+    @app.get("/console", include_in_schema=False)
+    def console() -> FileResponse:
+        return FileResponse(os.path.join(WEB_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
+
+    @app.get("/console/", include_in_schema=False)
+    def console_slash() -> RedirectResponse:
+        return RedirectResponse("/console", status_code=308)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> FileResponse:
+        return FileResponse(os.path.join(WEB_DIR, "favicon.svg"), media_type="image/svg+xml")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def not_found_page(request: Request, exc: StarletteHTTPException) -> Response:
+        # Unknown routes requested by a browser get an HTML page; API clients
+        # (and 404s raised by handlers, e.g. "User not found") keep JSON.
+        if exc.status_code == 404 and exc.detail == "Not Found" and _wants_html(request):
+            return FileResponse(os.path.join(WEB_DIR, "404.html"), status_code=404)
+        return await http_exception_handler(request, exc)
 
 
 def get_services(request: Request) -> Services:
@@ -184,6 +219,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - flat list of route h
             "status": "running",
             "regions": list(REGIONS),
             "docs": "/docs",
+            "console": "/console",
             "features": {
                 "sharding": "Geographic sharding with region-owned user ID blocks",
                 "caching": "Redis cache-aside",

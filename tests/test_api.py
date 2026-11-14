@@ -300,3 +300,27 @@ def test_redis_outage_on_os_endpoints(services, shards):
         # cache failures degrade to a database read
         assert c.get("/users/1", params={"region": "us"}).json()["username"] == "ada"
         assert c.get("/health").json()["redis"] == "DOWN"
+
+
+def test_console_page_and_assets(client):
+    page = client.get("/console")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "<title>GeoShardDB Console</title>" in page.text
+    for asset in ("app.js", "styles.css", "favicon.svg"):
+        assert client.get(f"/console/assets/{asset}").status_code == 200
+    assert client.get("/console/", follow_redirects=False).status_code == 308
+    assert client.get("/favicon.ico").headers["content-type"].startswith("image/svg+xml")
+    assert client.get("/").json()["console"] == "/console"
+
+
+def test_unknown_route_is_html_for_browsers_and_json_for_api_clients(client):
+    browser = client.get("/no-such-page", headers={"Accept": "text/html,application/xhtml+xml"})
+    assert browser.status_code == 404
+    assert "Page not found" in browser.text
+    api = client.get("/no-such-page")
+    assert api.status_code == 404
+    assert api.json() == {"detail": "Not Found"}
+    # 404s raised by handlers keep their JSON detail even for browsers.
+    missing_user = client.get("/users/42", params={"region": "us"}, headers={"Accept": "text/html"})
+    assert missing_user.json() == {"detail": "User not found"}
