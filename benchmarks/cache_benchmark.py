@@ -7,6 +7,7 @@ Run with ``python -m benchmarks.cache_benchmark``. Uses ``API_URL``
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import statistics
@@ -49,7 +50,12 @@ def timed_reads(targets: list[dict[str, Any]], label: str) -> list[float]:
     return samples
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Compare cold (PostgreSQL) and warm (Redis) user reads through the running API.",
+        epilog="Set API_URL (default http://localhost:8000) and, if the server uses one, ADMIN_API_KEY.",
+    )
+    parser.parse_args(argv)
     if request("/") is None:
         print(f"GeoShardDB API is not reachable at {API_URL}")
         return 1
