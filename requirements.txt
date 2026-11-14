@@ -1,9 +1,9 @@
-fastapi
-uvicorn
-psycopg2-binary
-prometheus-fastapi-instrumentator
-faker
-redis
-sentence-transformers
-faiss-cpu
-numpy
+# Runtime dependencies for the API, CLIs and benchmarks.
+fastapi==0.163.0
+uvicorn[standard]==0.54.0
+psycopg2-binary==2.9.13
+prometheus-fastapi-instrumentator==8.1.0
+redis==8.1.0
+numpy==2.5.4
+faker==40.54.0
+python-dotenv==1.2.4

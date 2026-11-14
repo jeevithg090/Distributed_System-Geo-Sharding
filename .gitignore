@@ -1,16 +1,31 @@
-venv/
+# Python
 __pycache__/
-*.pyc
-*.tar
-*.tar.gz
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
 .env
-
-# SSH keys
+.env.*
+!.env.example
 *.pem
+user_data.sh
 
-# RAG index files
-rag/rag_index.pkl
+# Generated data (RAG index, model cache)
+data/
 rag/*.pkl
 
-# macOS
+# Archives
+*.tar
+*.tar.gz
+
+# Editors / OS
+.idea/
+.vscode/
 .DS_Store
