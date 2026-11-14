@@ -1,109 +1,125 @@
-# redis_cache.py
-# Redis caching layer for GeoShardDB
+"""Redis cache-aside layer for user lookups.
 
-# pyrefly: ignore [missing-import]
-import redis
+Keys are namespaced ``{region}:user:{user_id}``. Hit/miss counters live in
+Redis so that stats are shared by every API replica behind the load balancer.
+Any Redis failure degrades to a cache miss instead of failing the request.
+"""
+
+from __future__ import annotations
+
 import json
-import os
-import time
+import logging
+from typing import Any
 
-RUNNING_IN_DOCKER = os.path.exists('/.dockerenv') or os.environ.get('RUNNING_IN_DOCKER') == 'true'
-REDIS_HOST = 'redis' if RUNNING_IN_DOCKER else 'localhost'
-REDIS_PORT = 6379
+import redis
+
+from core.config import REGIONS
+
+logger = logging.getLogger(__name__)
+
+HITS_KEY = "cache:stats:hits"
+MISSES_KEY = "cache:stats:misses"
+
 
 class RedisCache:
-    def __init__(self):
-        self.client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            decode_responses=True # Decode to unicode strings automatically
-        )
-        # In-memory counters for fallback stats if Redis stats not used
-        self.hits = 0
-        self.misses = 0
+    def __init__(self, client: redis.Redis, default_ttl: int = 300) -> None:
+        self.client = client
+        self.default_ttl = default_ttl
 
-    def _make_key(self, region, key):
+    @staticmethod
+    def make_key(region: str, key: str | int) -> str:
         return f"{region}:user:{key}"
 
-    def get(self, region, key):
+    def _incr(self, counter: str) -> None:
         try:
-            full_key = self._make_key(region, key)
-            val = self.client.get(full_key)
-            if val is not None:
-                self.hits += 1
-                return json.loads(val)# Converts the JSON to Python Dictonary 
-            self.misses += 1
+            self.client.incr(counter)
+        except redis.RedisError as exc:
+            logger.debug("Unable to update cache counter %s: %s", counter, exc)
+
+    def get(self, region: str, key: str | int) -> dict[str, Any] | None:
+        try:
+            raw = self.client.get(self.make_key(region, key))
+        except redis.RedisError as exc:
+            logger.warning("Redis GET failed, treating as miss: %s", exc)
             return None
-        except Exception as e:
-            print(f"Redis get error: {e}")
-            # Degrade gracefully on cache failure (treat as miss)
+        if raw is None:
+            self._incr(MISSES_KEY)
             return None
-
-    def set(self, region, key, value, ttl=300):
+        self._incr(HITS_KEY)
         try:
-            full_key = self._make_key(region, key)
-            serialized_val = json.dumps(value)
-            self.client.setex(full_key, ttl, serialized_val)
-            return True
-        except Exception as e:
-            print(f"Redis set error: {e}")
+            value: dict[str, Any] = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Discarding corrupt cache entry for %s", self.make_key(region, key))
+            return None
+        return value
+
+    def set(self, region: str, key: str | int, value: dict[str, Any], ttl: int | None = None) -> bool:
+        try:
+            self.client.set(self.make_key(region, key), json.dumps(value), ex=ttl or self.default_ttl)
+        except (redis.RedisError, TypeError, ValueError) as exc:
+            logger.warning("Redis SET failed: %s", exc)
             return False
+        return True
 
-    def invalidate(self, region, key):
+    def invalidate(self, region: str, key: str | int) -> bool:
         try:
-            full_key = self._make_key(region, key)
-            self.client.delete(full_key)
-            return True
-        except Exception as e:
-            print(f"Redis delete error: {e}")
+            self.client.delete(self.make_key(region, key))
+        except redis.RedisError as exc:
+            logger.warning("Redis DELETE failed: %s", exc)
             return False
+        return True
 
-    def invalidate_region(self, region):
+    def invalidate_region(self, region: str) -> int:
+        """Delete every cached user for ``region``. Returns the number of keys removed."""
+        deleted = 0
         try:
-            # Find all keys matching region namespace and delete them
-            pattern = f"{region}:user:*"
-            keys = self.client.keys(pattern)
-            if keys:
-                self.client.delete(*keys)
-            return True
-        except Exception as e:
-            print(f"Redis bulk delete error: {e}")
-            return False
+            batch: list[str] = []
+            for cache_key in self.client.scan_iter(match=f"{region}:user:*", count=500):
+                batch.append(cache_key)
+                if len(batch) >= 500:
+                    deleted += int(self.client.delete(*batch))
+                    batch.clear()
+            if batch:
+                deleted += int(self.client.delete(*batch))
+        except redis.RedisError as exc:
+            logger.warning("Redis bulk delete failed: %s", exc)
+        return deleted
 
-    def flush_all(self):
+    def flush_all(self) -> int:
+        """Remove all cached users (and reset counters) without touching locks or queues."""
+        deleted = sum(self.invalidate_region(region) for region in REGIONS)
         try:
-            self.client.flushdb()
-            return True
-        except Exception as e:
-            print(f"Redis flush error: {e}")
-            return False
+            self.client.delete(HITS_KEY, MISSES_KEY)
+        except redis.RedisError as exc:
+            logger.warning("Unable to reset cache counters: %s", exc)
+        return deleted
 
-    def get_stats(self):
-        total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0.0
-        
-        # Try to get Redis system stats as well
+    def get_stats(self) -> dict[str, Any]:
+        connected = True
         try:
-            info = self.client.info()
-            redis_connected = True
-            redis_version = info.get('redis_version')
-            used_memory_human = info.get('used_memory_human')
-            evicted_keys = info.get('evicted_keys', 0)
-        except Exception:
-            redis_connected = False
-            redis_version = "unknown"
-            used_memory_human = "0B"
-            evicted_keys = 0
+            hits = int(self.client.get(HITS_KEY) or 0)
+            misses = int(self.client.get(MISSES_KEY) or 0)
+        except redis.RedisError:
+            hits = misses = 0
+            connected = False
 
+        info: dict[str, Any] = {}
+        if connected:
+            try:
+                info = dict(self.client.info())
+            except redis.RedisError as exc:  # e.g. INFO disabled by an ACL
+                logger.debug("Redis INFO unavailable: %s", exc)
+
+        total = hits + misses
         return {
-            "cache_connected": redis_connected,
-            "redis_version": redis_version,
-            "used_memory": used_memory_human,
-            "evicted_keys": evicted_keys,
+            "cache_connected": connected,
+            "redis_version": info.get("redis_version", "unknown"),
+            "used_memory": info.get("used_memory_human", "unknown"),
+            "evicted_keys": info.get("evicted_keys", 0),
             "stats": {
-                "hits": self.hits,
-                "misses": self.misses,
-                "hit_rate_pct": round(hit_rate, 2),
-                "total_requests": total
-            }
+                "hits": hits,
+                "misses": misses,
+                "hit_rate_pct": round(hits / total * 100, 2) if total else 0.0,
+                "total_requests": total,
+            },
         }
