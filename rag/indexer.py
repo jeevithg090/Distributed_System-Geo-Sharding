@@ -1,70 +1,52 @@
-# rag/indexer.py
-# Script to build or refresh the RAG knowledge base vector index
+"""Build (or rebuild) the RAG vector index from the shards.
 
-import os
+Run with ``python -m rag.indexer``. The index is written atomically to
+``RAG_INDEX_PATH`` (default ``data/rag_index.json``).
+"""
+
+from __future__ import annotations
+
+import logging
 import sys
 
-# Ensure parent directory is in python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from core.config import get_settings
 from rag.embeddings import EmbeddingEngine
-from rag.vector_store import VectorStore
 from rag.knowledge_base import KnowledgeBase
+from rag.vector_store import VectorStore
 
-RUNNING_IN_DOCKER = os.path.exists('/.dockerenv') or os.environ.get('RUNNING_IN_DOCKER') == 'true'
+logger = logging.getLogger(__name__)
 
-if RUNNING_IN_DOCKER:
-    DB_CONFIGS = {
-        "us": {"host": "us-postgres-service", "port": 5432},
-        "eu": {"host": "eu-postgres-service", "port": 5432},
-        "asia": {"host": "asia-postgres-service", "port": 5432}
-    }
-else:
-    DB_CONFIGS = {
-        "us": {"host": "localhost", "port": 5433},
-        "eu": {"host": "localhost", "port": 5434},
-        "asia": {"host": "localhost", "port": 5435}
-    }
 
-INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_index.pkl")
+def build_index(
+    engine: EmbeddingEngine | None = None,
+    knowledge_base: KnowledgeBase | None = None,
+    index_path: str | None = None,
+) -> int:
+    """Harvest documents, embed them and save the index. Returns the document count."""
+    settings = get_settings()
+    engine = engine or EmbeddingEngine(settings.rag_embedding_backend, settings.rag_embedding_model)
+    knowledge_base = knowledge_base or KnowledgeBase()
+    index_path = index_path or settings.rag_index_path
 
-def build_index():
-    print("==================================================")
-    print("Starting RAG Indexer for GeoShardDB")
-    print("==================================================")
-    
-    # 1. Harvest documents
-    print("Harvesting documents from database shards...")
-    kb = KnowledgeBase(DB_CONFIGS)
-    docs = kb.harvest_all()
-    
-    if not docs:
-        print("Error: No documents harvested. Are the database shards running and seeded?")
-        print("Please run seed_data.py to populate databases first.")
-        return False
-        
-    print(f"Successfully harvested {len(docs)} knowledge documents:")
-    for idx, d in enumerate(docs):
-        print(f"  [{idx+1}] Source: {d.metadata.get('source')} | Region: {d.metadata.get('region')} | Preview: {d.text[:60]}...")
-        
-    # 2. Generate embeddings
-    print("\nInitializing Embedding Engine and generating vectors...")
-    engine = EmbeddingEngine()
-    
-    texts = [d.text for d in docs]
-    vectors = engine.embed_batch(texts)
-    print(f"Generated {len(vectors)} vectors of dimension {len(vectors[0])}")
-    
-    # 3. Build Vector Store
-    print("\nBuilding vector index...")
+    docs = knowledge_base.harvest_all()
+    if not any(d.metadata.get("source") == "stats" for d in docs):
+        logger.warning("No shard statistics harvested; are the shards running and seeded?")
+
+    vectors = engine.embed_batch([d.text for d in docs])
     store = VectorStore(dimension=len(vectors[0]))
+    store.embedding_backend = engine.backend
     store.add_documents(docs, vectors)
-    
-    # 4. Save to disk
-    store.save(INDEX_FILE)
-    print("RAG Indexer complete!")
-    print("==================================================")
-    return True
+    store.save(index_path)
+    logger.info("Indexed %d documents with %s embeddings", len(docs), engine.backend)
+    return len(docs)
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    count = build_index()
+    print(f"RAG index built with {count} documents at {get_settings().rag_index_path}")
+    return 0
+
 
 if __name__ == "__main__":
-    build_index()
+    sys.exit(main())
