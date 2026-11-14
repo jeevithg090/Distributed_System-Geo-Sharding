@@ -1,8 +1,7 @@
--- init_schema.sql
--- Database schema for GeoShardDB shards
-
--- Enable UUID extension if needed
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- db/init_schema.sql
+-- Schema shared by every GeoShardDB shard (US, EU, ASIA).
+-- user_id values come from per-region blocks (see core/config.py); seed_data.py
+-- moves each shard's users_user_id_seq to the start of its region's block.
 
 -- 1. users table
 CREATE TABLE IF NOT EXISTS users (
@@ -60,6 +59,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 -- Indexes for performance & vector context retrieval
 CREATE INDEX IF NOT EXISTS idx_users_region ON users(region);
 CREATE INDEX IF NOT EXISTS idx_users_subscription ON users(subscription_type);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+-- Lets the replication worker find pending rows without a full scan.
+CREATE INDEX IF NOT EXISTS idx_users_unreplicated ON users(user_id) WHERE replicated = FALSE;
 CREATE INDEX IF NOT EXISTS idx_products_region ON products(region);
 CREATE INDEX IF NOT EXISTS idx_support_tickets_region ON support_tickets(region);
 CREATE INDEX IF NOT EXISTS idx_support_tickets_priority ON support_tickets(priority);

@@ -1,48 +1,66 @@
+# GeoShardDB API. Build the image into your cluster's runtime first, e.g.
+#   docker build -t geoshard-api:latest .   (then `kind load docker-image` / `minikube image load`)
 apiVersion: apps/v1
 kind: Deployment
-
 metadata:
   name: geoshard-api
-
+  labels:
+    app: geoshard-api
 spec:
-  replicas: 1
-
+  replicas: 1 # the RAG index lives on the pod's disk; use a shared volume before scaling up
   selector:
     matchLabels:
       app: geoshard-api
-
   template:
-
     metadata:
       labels:
         app: geoshard-api
-
     spec:
-
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       containers:
-
-      - name: api
-
-        image: geoshard-api:latest
-
-        imagePullPolicy: Never
-
-        ports:
-        - containerPort: 8000
+        - name: api
+          image: geoshard-api:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: {name: geoshard-db, key: POSTGRES_USER}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: geoshard-db, key: POSTGRES_PASSWORD}
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef: {name: geoshard-db, key: ADMIN_API_KEY, optional: true}
+            - {name: SHARD_US_HOST, value: us-postgres-service}
+            - {name: SHARD_US_PORT, value: "5432"}
+            - {name: SHARD_EU_HOST, value: eu-postgres-service}
+            - {name: SHARD_EU_PORT, value: "5432"}
+            - {name: SHARD_ASIA_HOST, value: asia-postgres-service}
+            - {name: SHARD_ASIA_PORT, value: "5432"}
+            - {name: REDIS_HOST, value: redis}
+          readinessProbe:
+            httpGet: {path: /, port: 8000}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: 8000}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 100m, memory: 512Mi}
+            limits: {memory: 2Gi}
 ---
 apiVersion: v1
 kind: Service
-
 metadata:
   name: geoshard-api-service
-
 spec:
-
   type: NodePort
-
   selector:
     app: geoshard-api
-
   ports:
     - port: 8000
       targetPort: 8000
