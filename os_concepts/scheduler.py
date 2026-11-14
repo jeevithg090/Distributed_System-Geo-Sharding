@@ -1,356 +1,256 @@
-# os_concepts/scheduler.py
-# Request Scheduler simulator implementing FCFS, RR, Priority Queue, SJF, and MLFQ scheduling algorithms.
+"""Request scheduler simulator: FCFS, SJF, Priority, Round Robin and MLFQ.
 
-import time
-from collections import deque
+Each request has an ``arrival_time`` and a ``cost_units`` (simulated execution
+time). Every ``schedule_*`` method mutates the requests' timing fields and
+returns ``(completed_requests, timeline)`` where ``timeline`` lists the
+execution slices in order.
+"""
+
+from __future__ import annotations
+
 import random
+from collections import deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
+ALGORITHMS = ("fcfs", "sjf", "priority", "rr", "mlfq")
+
+
+@dataclass
 class Request:
-    def __init__(self, request_id, user_id, region, priority, cost_units, arrival_time):
-        self.request_id = request_id
-        self.user_id = user_id
-        self.region = region
-        self.priority = priority # 1 = low, 2 = medium, 3 = high (for priority queue)
-        self.cost_units = cost_units # Simulated query execution time units (SJF)
-        self.remaining_cost = cost_units
-        self.arrival_time = arrival_time
+    request_id: str
+    user_id: int
+    region: str
+    priority: int  # 1 = low, 2 = medium, 3 = high
+    cost_units: int
+    arrival_time: int
+    remaining_cost: int = field(init=False)
+    start_time: int | None = None
+    completion_time: int | None = None
+    waiting_time: int = 0
+    turnaround_time: int = 0
+
+    def __post_init__(self) -> None:
+        if self.cost_units < 1:
+            raise ValueError("cost_units must be positive")
+        self.remaining_cost = self.cost_units
+
+    def reset(self) -> None:
+        self.remaining_cost = self.cost_units
         self.start_time = None
         self.completion_time = None
         self.waiting_time = 0
         self.turnaround_time = 0
 
+    def finish(self, now: int) -> None:
+        self.completion_time = now
+        self.turnaround_time = now - self.arrival_time
+        self.waiting_time = self.turnaround_time - self.cost_units
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "user_id": self.user_id,
+            "region": self.region,
+            "priority": self.priority,
+            "cost_units": self.cost_units,
+            "arrival_time": self.arrival_time,
+            "start_time": self.start_time,
+            "completion_time": self.completion_time,
+            "waiting_time": self.waiting_time,
+            "turnaround_time": self.turnaround_time,
+        }
+
+
+def _slice(req: Request, start: int, end: int, queue: int | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "request_id": req.request_id,
+        "start": start,
+        "end": end,
+        "user_id": req.user_id,
+        "region": req.region,
+    }
+    if queue is not None:
+        entry["queue"] = queue
+    return entry
+
+
 class RequestScheduler:
-    def __init__(self):
-        pass
+    def run(self, algorithm: str, requests: Sequence[Request]) -> tuple[list[Request], list[dict[str, Any]]]:
+        """Dispatch by name (``fcfs``, ``sjf``, ``priority``, ``rr``, ``mlfq``)."""
+        handlers: dict[str, Callable[[Sequence[Request]], tuple[list[Request], list[dict[str, Any]]]]] = {
+            "fcfs": self.schedule_fcfs,
+            "sjf": self.schedule_sjf,
+            "priority": self.schedule_priority,
+            "rr": self.schedule_rr,
+            "mlfq": self.schedule_mlfq,
+        }
+        try:
+            handler = handlers[algorithm.lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unknown scheduling algorithm: {algorithm}") from exc
+        for req in requests:
+            req.reset()
+        return handler(requests)
 
-    def schedule_fcfs(self, requests):
-        """First Come First Served Scheduling"""
-        sorted_reqs = sorted(requests, key=lambda r: r.arrival_time)
-        current_time = 0
+    def schedule_fcfs(self, requests: Sequence[Request]) -> tuple[list[Request], list[dict[str, Any]]]:
+        """First Come First Served."""
+        ordered = sorted(requests, key=lambda r: r.arrival_time)
+        now = 0
         timeline = []
-        
-        for req in sorted_reqs:
-            if current_time < req.arrival_time:
-                current_time = req.arrival_time
-            
-            req.start_time = current_time
-            # Simulate processing
-            current_time += req.cost_units
-            req.completion_time = current_time
-            req.waiting_time = req.start_time - req.arrival_time
-            req.turnaround_time = req.completion_time - req.arrival_time
-            
-            timeline.append({
-                "request_id": req.request_id,
-                "start": req.start_time,
-                "end": req.completion_time,
-                "user_id": req.user_id,
-                "region": req.region
-            })
-            
-        return sorted_reqs, timeline
+        for req in ordered:
+            now = max(now, req.arrival_time)
+            req.start_time = now
+            now += req.cost_units
+            req.finish(now)
+            timeline.append(_slice(req, req.start_time, now))
+        return ordered, timeline
 
-    def schedule_sjf(self, requests):
-        """Shortest Job First (Non-preemptive)"""
-        sorted_by_arrival = sorted(requests, key=lambda r: r.arrival_time)
-        current_time = 0
+    def _non_preemptive(
+        self, requests: Sequence[Request], key: Callable[[Request], Any]
+    ) -> tuple[list[Request], list[dict[str, Any]]]:
+        pending = sorted(requests, key=lambda r: r.arrival_time)
+        ready: list[Request] = []
+        completed: list[Request] = []
         timeline = []
-        completed = []
-        ready_queue = []
-        
+        now = 0
         i = 0
-        n = len(requests)
-        
-        while len(completed) < n:
-            # Load all arrived jobs into ready queue
-            while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                ready_queue.append(sorted_by_arrival[i])
+        while len(completed) < len(pending):
+            while i < len(pending) and pending[i].arrival_time <= now:
+                ready.append(pending[i])
                 i += 1
-                
-            if not ready_queue:
-                if i < n:
-                    current_time = sorted_by_arrival[i].arrival_time
-                    continue
-                else:
-                    break
-                    
-            # Sort ready queue by query cost (shortest job first)
-            ready_queue.sort(key=lambda r: r.cost_units)
-            req = ready_queue.pop(0)
-            
-            req.start_time = current_time
-            current_time += req.cost_units
-            req.completion_time = current_time
-            req.waiting_time = req.start_time - req.arrival_time
-            req.turnaround_time = req.completion_time - req.arrival_time
+            if not ready:
+                now = pending[i].arrival_time
+                continue
+            ready.sort(key=key)
+            req = ready.pop(0)
+            req.start_time = now
+            now += req.cost_units
+            req.finish(now)
             completed.append(req)
-            
-            timeline.append({
-                "request_id": req.request_id,
-                "start": req.start_time,
-                "end": req.completion_time,
-                "user_id": req.user_id,
-                "region": req.region
-            })
-            
+            timeline.append(_slice(req, req.start_time, now))
         return completed, timeline
 
-    def schedule_priority(self, requests):
-        """Priority Scheduling (Non-preemptive, Higher Priority Number = Higher Priority)"""
-        sorted_by_arrival = sorted(requests, key=lambda r: r.arrival_time)
-        current_time = 0
-        timeline = []
-        completed = []
-        ready_queue = []
-        
-        i = 0
-        n = len(requests)
-        
-        while len(completed) < n:
-            while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                ready_queue.append(sorted_by_arrival[i])
-                i += 1
-                
-            if not ready_queue:
-                if i < n:
-                    current_time = sorted_by_arrival[i].arrival_time
-                    continue
-                else:
-                    break
-                    
-            # Sort by priority desc (high priority first), then by arrival asc
-            ready_queue.sort(key=lambda r: (-r.priority, r.arrival_time))
-            req = ready_queue.pop(0)
-            
-            req.start_time = current_time
-            current_time += req.cost_units
-            req.completion_time = current_time
-            req.waiting_time = req.start_time - req.arrival_time
-            req.turnaround_time = req.completion_time - req.arrival_time
-            completed.append(req)
-            
-            timeline.append({
-                "request_id": req.request_id,
-                "start": req.start_time,
-                "end": req.completion_time,
-                "user_id": req.user_id,
-                "region": req.region
-            })
-            
-        return completed, timeline
+    def schedule_sjf(self, requests: Sequence[Request]) -> tuple[list[Request], list[dict[str, Any]]]:
+        """Shortest Job First (non-preemptive); ties go to the earlier arrival."""
+        return self._non_preemptive(requests, key=lambda r: (r.cost_units, r.arrival_time))
 
-    def schedule_rr(self, requests, quantum=4):
-        """Round Robin Scheduling"""
-        sorted_by_arrival = sorted(requests, key=lambda r: r.arrival_time)
-        current_time = 0
+    def schedule_priority(self, requests: Sequence[Request]) -> tuple[list[Request], list[dict[str, Any]]]:
+        """Non-preemptive priority scheduling (higher number = higher priority)."""
+        return self._non_preemptive(requests, key=lambda r: (-r.priority, r.arrival_time))
+
+    def schedule_rr(
+        self, requests: Sequence[Request], quantum: int = 4
+    ) -> tuple[list[Request], list[dict[str, Any]]]:
+        """Round Robin with a fixed time quantum."""
+        if quantum < 1:
+            raise ValueError("quantum must be positive")
+        pending = sorted(requests, key=lambda r: r.arrival_time)
+        for req in pending:
+            req.remaining_cost = req.cost_units
+        ready: deque[Request] = deque()
+        completed: list[Request] = []
         timeline = []
-        completed = []
-        ready_queue = deque()
-        
-        # Deep copy remaining costs
-        for r in sorted_by_arrival:
-            r.remaining_cost = r.cost_units
-            
+        now = 0
         i = 0
-        n = len(requests)
-        
-        # Initialize
-        if n > 0:
-            current_time = sorted_by_arrival[0].arrival_time
-            while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                ready_queue.append(sorted_by_arrival[i])
+
+        def admit() -> None:
+            nonlocal i
+            while i < len(pending) and pending[i].arrival_time <= now:
+                ready.append(pending[i])
                 i += 1
-                
-        while ready_queue or i < n:
-            if not ready_queue:
-                current_time = sorted_by_arrival[i].arrival_time
-                while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                    ready_queue.append(sorted_by_arrival[i])
-                    i += 1
-                    
-            req = ready_queue.popleft()
-            
+
+        while ready or i < len(pending):
+            if not ready:
+                now = max(now, pending[i].arrival_time)
+                admit()
+            req = ready.popleft()
             if req.start_time is None:
-                req.start_time = current_time
-                
-            exec_time = min(quantum, req.remaining_cost)
-            timeline.append({
-                "request_id": req.request_id,
-                "start": current_time,
-                "end": current_time + exec_time,
-                "user_id": req.user_id,
-                "region": req.region
-            })
-            
-            current_time += exec_time
-            req.remaining_cost -= exec_time
-            
-            # Load new arrivals during this execution quantum
-            while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                ready_queue.append(sorted_by_arrival[i])
-                i += 1
-                
+                req.start_time = now
+            run_for = min(quantum, req.remaining_cost)
+            timeline.append(_slice(req, now, now + run_for))
+            now += run_for
+            req.remaining_cost -= run_for
+            admit()  # arrivals during the slice queue ahead of the preempted request
             if req.remaining_cost > 0:
-                # Put back in queue
-                ready_queue.append(req)
+                ready.append(req)
             else:
-                req.completion_time = current_time
-                req.waiting_time = req.completion_time - req.arrival_time - req.cost_units
-                req.turnaround_time = req.completion_time - req.arrival_time
+                req.finish(now)
                 completed.append(req)
-                
         return completed, timeline
 
-    def schedule_mlfq(self, requests, quantums=[2, 6]):
-        """Multilevel Feedback Queue Scheduling
-        - Queue 0: RR with Quantum=2 (Highest Priority)
-        - Queue 1: RR with Quantum=6 (Medium Priority)
-        - Queue 2: FCFS (Lowest Priority)
+    def schedule_mlfq(
+        self, requests: Sequence[Request], quantums: tuple[int, int] = (2, 6)
+    ) -> tuple[list[Request], list[dict[str, Any]]]:
+        """Three-level Multilevel Feedback Queue.
+
+        * Q0: round robin with ``quantums[0]`` (new arrivals land here)
+        * Q1: round robin with ``quantums[1]`` (demoted from Q0)
+        * Q2: FCFS, run one unit at a time so new arrivals can preempt it
         """
-        sorted_by_arrival = sorted(requests, key=lambda r: r.arrival_time)
-        current_time = 0
+        pending = sorted(requests, key=lambda r: r.arrival_time)
+        for req in pending:
+            req.remaining_cost = req.cost_units
+        queues: tuple[deque[Request], deque[Request], deque[Request]] = (deque(), deque(), deque())
+        completed: list[Request] = []
         timeline = []
-        completed = []
-        
-        # Queues
-        q0 = deque() # Q0: RR q=2
-        q1 = deque() # Q1: RR q=6
-        q2 = deque() # Q2: FCFS
-        
-        for r in sorted_by_arrival:
-            r.remaining_cost = r.cost_units
-            
+        now = 0
         i = 0
-        n = len(requests)
-        
-        if n > 0:
-            current_time = sorted_by_arrival[0].arrival_time
-            while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                q0.append(sorted_by_arrival[i])
+
+        def admit() -> None:
+            nonlocal i
+            while i < len(pending) and pending[i].arrival_time <= now:
+                queues[0].append(pending[i])
                 i += 1
-                
-        while q0 or q1 or q2 or i < n:
-            # Check for idle time
-            if not q0 and not q1 and not q2:
-                current_time = sorted_by_arrival[i].arrival_time
-                while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                    q0.append(sorted_by_arrival[i])
-                    i += 1
-            
-            # Execute Q0 (Highest Priority)
-            if q0:
-                req = q0.popleft()
-                if req.start_time is None:
-                    req.start_time = current_time
-                exec_time = min(quantums[0], req.remaining_cost)
-                timeline.append({
-                    "request_id": req.request_id,
-                    "queue": 0,
-                    "start": current_time,
-                    "end": current_time + exec_time,
-                    "user_id": req.user_id,
-                    "region": req.region
-                })
-                current_time += exec_time
-                req.remaining_cost -= exec_time
-                
-                # Check for new arrivals
-                while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                    q0.append(sorted_by_arrival[i])
-                    i += 1
-                    
-                if req.remaining_cost > 0:
-                    q1.append(req) # Demote to Q1
-                else:
-                    req.completion_time = current_time
-                    req.waiting_time = req.completion_time - req.arrival_time - req.cost_units
-                    req.turnaround_time = req.completion_time - req.arrival_time
-                    completed.append(req)
-                    
-            # Execute Q1 (Medium Priority)
-            elif q1:
-                req = q1.popleft()
-                if req.start_time is None:
-                    req.start_time = current_time
-                exec_time = min(quantums[1], req.remaining_cost)
-                timeline.append({
-                    "request_id": req.request_id,
-                    "queue": 1,
-                    "start": current_time,
-                    "end": current_time + exec_time,
-                    "user_id": req.user_id,
-                    "region": req.region
-                })
-                current_time += exec_time
-                req.remaining_cost -= exec_time
-                
-                # Check for new arrivals (which preempt Q1 since they go to Q0)
-                new_arrivals = False
-                while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                    q0.append(sorted_by_arrival[i])
-                    i += 1
-                    new_arrivals = True
-                    
-                if req.remaining_cost > 0:
-                    q2.append(req) # Demote to Q2
-                else:
-                    req.completion_time = current_time
-                    req.waiting_time = req.completion_time - req.arrival_time - req.cost_units
-                    req.turnaround_time = req.completion_time - req.arrival_time
-                    completed.append(req)
-                    
-            # Execute Q2 (Lowest Priority - FCFS)
-            elif q2:
-                req = q2.popleft()
-                if req.start_time is None:
-                    req.start_time = current_time
-                
-                # We execute Q2 one unit at a time to allow preemption by new arrivals in Q0
-                exec_time = 1
-                timeline.append({
-                    "request_id": req.request_id,
-                    "queue": 2,
-                    "start": current_time,
-                    "end": current_time + exec_time,
-                    "user_id": req.user_id,
-                    "region": req.region
-                })
-                current_time += exec_time
-                req.remaining_cost -= exec_time
-                
-                # Check for new arrivals
-                new_arrivals = False
-                while i < n and sorted_by_arrival[i].arrival_time <= current_time:
-                    q0.append(sorted_by_arrival[i])
-                    i += 1
-                    new_arrivals = True
-                    
-                if req.remaining_cost > 0:
-                    # Q2 stays in Q2
-                    q2.appendleft(req)
-                else:
-                    req.completion_time = current_time
-                    req.waiting_time = req.completion_time - req.arrival_time - req.cost_units
-                    req.turnaround_time = req.completion_time - req.arrival_time
-                    completed.append(req)
-                    
+
+        while any(queues) or i < len(pending):
+            if not any(queues):
+                now = max(now, pending[i].arrival_time)
+                admit()
+            level = next(n for n, q in enumerate(queues) if q)
+            req = queues[level].popleft()
+            if req.start_time is None:
+                req.start_time = now
+            run_for = min(quantums[level] if level < 2 else 1, req.remaining_cost)
+            timeline.append(_slice(req, now, now + run_for, queue=level))
+            now += run_for
+            req.remaining_cost -= run_for
+            admit()
+            if req.remaining_cost == 0:
+                req.finish(now)
+                completed.append(req)
+            elif level < 2:
+                queues[level + 1].append(req)  # used its full quantum: demote
+            else:
+                queues[2].appendleft(req)  # FCFS: keep running unless preempted
         return completed, timeline
 
-def generate_random_workload(count=15):
+
+def summarize(requests: Sequence[Request]) -> dict[str, float]:
+    if not requests:
+        return {"avg_waiting_time": 0.0, "avg_turnaround_time": 0.0}
+    return {
+        "avg_waiting_time": round(sum(r.waiting_time for r in requests) / len(requests), 2),
+        "avg_turnaround_time": round(sum(r.turnaround_time for r in requests) / len(requests), 2),
+    }
+
+
+def generate_random_workload(count: int = 15, seed: int | None = None) -> list[Request]:
+    """Generate ``count`` requests with random arrival gaps, costs and priorities."""
+    rng = random.Random(seed)
     requests = []
-    current_arrival = 0
+    arrival = 0
     for i in range(count):
-        current_arrival += random.randint(0, 3)
-        cost = random.choice([2, 4, 6, 8, 12, 16])
-        priority = random.choice([1, 2, 3]) # 1=low, 2=med, 3=high
-        region = random.choice(["us", "eu", "asia"])
-        user_id = random.randint(1000, 9999)
-        requests.append(Request(
-            request_id=f"REQ-{i+1:02d}",
-            user_id=user_id,
-            region=region,
-            priority=priority,
-            cost_units=cost,
-            arrival_time=current_arrival
-        ))
+        arrival += rng.randint(0, 3)
+        requests.append(
+            Request(
+                request_id=f"REQ-{i + 1:02d}",
+                user_id=rng.randint(1000, 9999),
+                region=rng.choice(["us", "eu", "asia"]),
+                priority=rng.choice([1, 2, 3]),
+                cost_units=rng.choice([2, 4, 6, 8, 12, 16]),
+                arrival_time=arrival,
+            )
+        )
     return requests
