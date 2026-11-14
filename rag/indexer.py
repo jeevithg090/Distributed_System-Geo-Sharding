@@ -6,6 +6,7 @@ Run with ``python -m rag.indexer``. The index is written atomically to
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 
@@ -41,10 +42,19 @@ def build_index(
     return len(docs)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build (or rebuild) the RAG vector index from the PostgreSQL shards.",
+        epilog="Embedding backend and model come from RAG_EMBEDDING_BACKEND / RAG_EMBEDDING_MODEL.",
+    )
+    parser.add_argument(
+        "--output", help="index file to write (default: RAG_INDEX_PATH or data/rag_index.json)"
+    )
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    count = build_index()
-    print(f"RAG index built with {count} documents at {get_settings().rag_index_path}")
+    path = args.output or get_settings().rag_index_path
+    count = build_index(index_path=path)
+    print(f"RAG index built with {count} documents at {path}")
     return 0
 
 
