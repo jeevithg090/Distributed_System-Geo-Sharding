@@ -3,11 +3,11 @@ name = "geosharddb"
 version = "2.1.0"
 description = "Multi-region distributed database simulator: geo-sharded PostgreSQL, Redis cache-aside, circuit-breaker failover, RAG and OS-concept demos"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py312"
 extend-exclude = ["data"]
 
 [tool.ruff.lint]
@@ -35,7 +35,7 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning:faiss.*"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 check_untyped_defs = true
 warn_unused_ignores = true
