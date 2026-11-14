@@ -82,7 +82,7 @@ Breakers are kept in each replica's memory, as client-side breakers usually are.
 
 | Area | Technology |
 |------|------------|
-| API | Python 3.11+, FastAPI, Uvicorn, Pydantic |
+| API | Python 3.12+, FastAPI, Uvicorn, Pydantic |
 | Data | PostgreSQL 16 (psycopg2), Redis 7 |
 | RAG | NumPy; optional sentence-transformers and FAISS |
 | Infra | Docker Compose, NGINX, Kubernetes manifests, AWS CLI script |
@@ -250,7 +250,7 @@ docker compose up -d us-node eu-node asia-node
 GEOSHARD_INTEGRATION=1 pytest tests/test_integration.py
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint, format, mypy and shellcheck. It also runs the full test suite against three PostgreSQL service containers on Python 3.11, 3.12 and 3.13, validates the Compose file, and builds and smoke-tests the Docker image.
+CI (`.github/workflows/ci.yml`) runs lint, format, mypy and shellcheck. It also runs the full test suite against three PostgreSQL service containers on Python 3.12 and 3.13, validates the Compose file, and builds and smoke-tests the Docker image.
 
 ---
 
