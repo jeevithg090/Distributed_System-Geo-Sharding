@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GeoShardDB Console</title>
+  <meta name="description" content="Operator console for GeoShardDB: watch three geo-sharded PostgreSQL regions, look up users with cache-aside and failover, query the RAG assistant and run OS-concept simulations.">
+  <meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="GeoShardDB Console">
+  <meta property="og:description" content="Geo-sharded PostgreSQL with Redis caching, circuit-breaker failover, a RAG assistant and OS-concept labs.">
+  <meta property="og:image" content="/console/assets/og-image.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/console/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/console/assets/styles.css">
+  <script>
+    // Apply the saved theme before first paint to avoid a flash.
+    try {
+      const t = localStorage.getItem("geoshard-theme");
+      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    } catch (_) { /* storage unavailable */ }
+  </script>
+  <script src="/console/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/overview" aria-label="GeoShardDB console home">
+        <img src="/console/assets/favicon.svg" alt="" width="28" height="28">
+        <span>GeoShard<strong>DB</strong></span>
+      </a>
+      <span id="global-status" class="pill pill-muted" role="status" aria-live="polite">Checking…</span>
+      <div class="topbar-actions">
+        <a class="btn btn-ghost btn-sm hide-sm" href="/docs" target="_blank" rel="noopener">API docs</a>
+        <button type="button" class="btn btn-ghost btn-sm" id="admin-key-btn" aria-haspopup="dialog">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="icon"><path d="M15 7a4 4 0 1 0-3.9 5H12l2 2h2v2h2v2h3v-3.6l-6.1-6.1A4 4 0 0 0 15 7Zm-6 0a1.5 1.5 0 1 1 3 0 1.5 1.5 0 0 1-3 0Z" fill="currentColor"/></svg>
+          <span class="hide-sm">Admin key</span>
+          <span id="admin-key-dot" class="dot" hidden></span>
+        </button>
+        <button type="button" class="btn btn-ghost btn-sm btn-icon" id="theme-btn" aria-label="Switch to dark theme">
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="icon icon-moon"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" fill="currentColor"/></svg>
+          <svg aria-hidden="true" viewBox="0 0 24 24" class="icon icon-sun"><circle cx="12" cy="12" r="4.5" fill="currentColor"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="shell">
+    <nav class="sidenav" aria-label="Console sections">
+      <ul>
+        <li><a href="#/overview" data-view="overview">Overview</a></li>
+        <li><a href="#/users" data-view="users">Users</a></li>
+        <li><a href="#/assistant" data-view="assistant">Assistant</a></li>
+        <li class="nav-heading" aria-hidden="true">OS labs</li>
+        <li><a href="#/scheduler" data-view="scheduler">Scheduler</a></li>
+        <li><a href="#/paging" data-view="paging">Page replacement</a></li>
+        <li><a href="#/coordination" data-view="coordination">Locks &amp; deadlocks</a></li>
+        <li><a href="#/queue" data-view="queue">Work queue</a></li>
+      </ul>
+    </nav>
+
+    <main id="main" tabindex="-1">
+      <!-- ============================================================ Overview -->
+      <section class="view" data-view="overview" aria-labelledby="h-overview" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-overview">Cluster overview</h1>
+            <p class="lead">Live health of every regional shard, the cache, the RAG index and the work queue.</p>
+          </div>
+          <div class="view-actions">
+            <label class="switch">
+              <input type="checkbox" id="auto-refresh" checked>
+              <span>Auto-refresh</span>
+            </label>
+            <button type="button" class="btn btn-secondary" id="overview-refresh">Refresh</button>
+          </div>
+        </div>
+        <div id="overview-alert"></div>
+        <h2 class="section-title">Regions</h2>
+        <div class="grid grid-3" id="region-cards" aria-busy="true"></div>
+        <h2 class="section-title">Services</h2>
+        <div class="grid grid-3" id="service-cards" aria-busy="true"></div>
+        <p class="meta" id="overview-updated" aria-live="polite"></p>
+      </section>
+
+      <!-- =============================================================== Users -->
+      <section class="view" data-view="users" aria-labelledby="h-users" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-users">User lookup</h1>
+            <p class="lead">Reads go through the Redis cache first, then the home shard, then fail over to a replica.</p>
+          </div>
+        </div>
+        <div class="grid grid-2-1">
+          <div class="card">
+            <form id="user-form" class="form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label for="user-id">User ID</label>
+                  <input id="user-id" name="user_id" type="number" inputmode="numeric" min="1" max="2999999" required aria-describedby="user-id-hint user-id-error">
+                  <p class="hint" id="user-id-hint">US owns 1–1,000,000 · EU 1,000,001–2,000,000 · ASIA 2,000,001–3,000,000</p>
+                  <p class="error-text" id="user-id-error" hidden></p>
+                </div>
+                <div class="field">
+                  <label for="user-region">Region</label>
+                  <select id="user-region" name="region" aria-describedby="user-region-hint">
+                    <option value="">Auto (from ID)</option>
+                    <option value="us">US</option>
+                    <option value="eu">EU</option>
+                    <option value="asia">ASIA</option>
+                  </select>
+                  <p class="hint" id="user-region-hint">Pick a region to read from that shard first.</p>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Look up user</button>
+                <span class="chips" aria-label="Example user IDs">
+                  <button type="button" class="chip" data-user="1">#1 (US)</button>
+                  <button type="button" class="chip" data-user="1000001">#1000001 (EU)</button>
+                  <button type="button" class="chip" data-user="2000001">#2000001 (ASIA)</button>
+                </span>
+              </div>
+            </form>
+            <div id="user-result" class="result" aria-live="polite"></div>
+          </div>
+          <div class="card card-muted">
+            <h2 class="card-title">How a read is served</h2>
+            <ol class="steps">
+              <li><strong>Cache</strong> — Redis key <code>region:user:id</code>, 5 min TTL by default.</li>
+              <li><strong>Home shard</strong> — derived from the ID block unless you pick a region.</li>
+              <li><strong>Failover</strong> — on error the breaker records a failure and the read moves to the next healthy region in the same request.</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Newest users across all shards</h2>
+              <p class="meta">Parallel fan-out query to every region.</p>
+            </div>
+            <form id="recent-form" class="inline-form">
+              <label for="recent-limit">Per shard</label>
+              <select id="recent-limit">
+                <option>3</option><option selected>5</option><option>10</option><option>25</option>
+              </select>
+              <button type="submit" class="btn btn-secondary">Run query</button>
+            </form>
+          </div>
+          <div id="recent-result" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- =========================================================== Assistant -->
+      <section class="view" data-view="assistant" aria-labelledby="h-assistant" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-assistant">RAG assistant</h1>
+            <p class="lead">Retrieval-only answers over shard statistics, products, tickets and audit logs.</p>
+          </div>
+          <div class="view-actions">
+            <button type="button" class="btn btn-secondary" id="rag-reindex" data-admin>Rebuild index</button>
+          </div>
+        </div>
+        <div id="rag-status"></div>
+        <div class="card">
+          <form id="rag-form" class="form" novalidate>
+            <div class="field">
+              <label for="rag-question">Question</label>
+              <textarea id="rag-question" rows="3" maxlength="500" required aria-describedby="rag-count rag-error" placeholder="e.g. How many users are on the ASIA shard?"></textarea>
+              <div class="field-foot">
+                <p class="error-text" id="rag-error" hidden></p>
+                <p class="hint counter" id="rag-count">0 / 500</p>
+              </div>
+            </div>
+            <div class="form-actions">
+              <div class="inline-form">
+                <label for="rag-topk">Documents</label>
+                <select id="rag-topk"><option>1</option><option>2</option><option selected>3</option><option>5</option><option>10</option></select>
+              </div>
+              <button type="submit" class="btn btn-primary">Ask</button>
+            </div>
+            <div class="chips" aria-label="Example questions">
+              <button type="button" class="chip" data-q="How many support tickets does the EU shard have?">EU support tickets</button>
+              <button type="button" class="chip" data-q="How does failover work when a shard is down?">Failover</button>
+              <button type="button" class="chip" data-q="What columns does the users table have?">Users schema</button>
+            </div>
+          </form>
+        </div>
+        <div id="rag-result" aria-live="polite"></div>
+      </section>
+
+      <!-- =========================================================== Scheduler -->
+      <section class="view" data-view="scheduler" aria-labelledby="h-scheduler" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-scheduler">Request scheduler</h1>
+            <p class="lead">Simulate how a gateway would order queued shard requests under classic CPU-scheduling policies.</p>
+          </div>
+        </div>
+        <div class="card">
+          <form id="sched-form" class="form" novalidate>
+            <div class="form-row form-row-4">
+              <div class="field">
+                <label for="sched-alg">Algorithm</label>
+                <select id="sched-alg">
+                  <option value="fcfs">FCFS — first come, first served</option>
+                  <option value="sjf">SJF — shortest job first</option>
+                  <option value="priority">Priority</option>
+                  <option value="rr">Round robin</option>
+                  <option value="mlfq">MLFQ — multilevel feedback</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="sched-count">Requests</label>
+                <input id="sched-count" type="number" min="1" max="100" value="10" required aria-describedby="sched-count-error">
+                <p class="error-text" id="sched-count-error" hidden></p>
+              </div>
+              <div class="field">
+                <label for="sched-seed">Seed <span class="optional">(optional)</span></label>
+                <input id="sched-seed" type="number" value="7" aria-describedby="sched-seed-hint">
+                <p class="hint" id="sched-seed-hint">Same seed, same workload.</p>
+              </div>
+              <div class="field field-end">
+                <button type="submit" class="btn btn-primary btn-block">Run simulation</button>
+              </div>
+            </div>
+          </form>
+        </div>
+        <div id="sched-result" aria-live="polite"></div>
+      </section>
+
+      <!-- ============================================================== Paging -->
+      <section class="view" data-view="paging" aria-labelledby="h-paging" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-paging">Page replacement</h1>
+            <p class="lead">Replay an access trace against a fixed-size cache and see every hit, miss and eviction.</p>
+          </div>
+        </div>
+        <div class="card">
+          <form id="page-form" class="form" novalidate>
+            <div class="form-row form-row-3">
+              <div class="field">
+                <label for="page-alg">Algorithm</label>
+                <select id="page-alg">
+                  <option value="lru">LRU — least recently used</option>
+                  <option value="fifo">FIFO — first in, first out</option>
+                  <option value="lfu">LFU — least frequently used</option>
+                  <option value="clock">Clock — second chance</option>
+                  <option value="optimal">Optimal (Bélády)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="page-cap">Frames</label>
+                <input id="page-cap" type="number" min="1" max="64" value="3" required aria-describedby="page-cap-error">
+                <p class="error-text" id="page-cap-error" hidden></p>
+              </div>
+              <div class="field">
+                <label for="page-trace">Access trace</label>
+                <input id="page-trace" type="text" inputmode="numeric" value="1,2,3,4,1,2,5,1,2,3,4,5" autocomplete="off" spellcheck="false" aria-describedby="page-trace-hint page-trace-error">
+                <p class="hint" id="page-trace-hint">Comma-separated page numbers.</p>
+                <p class="error-text" id="page-trace-error" hidden></p>
+              </div>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">Simulate</button>
+              <button type="button" class="btn btn-secondary" id="page-compare">Compare all algorithms</button>
+            </div>
+          </form>
+        </div>
+        <div id="page-compare-result" aria-live="polite"></div>
+        <div id="page-result" aria-live="polite"></div>
+      </section>
+
+      <!-- ======================================================== Coordination -->
+      <section class="view" data-view="coordination" aria-labelledby="h-coord" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-coord">Locks, semaphores &amp; deadlocks</h1>
+            <p class="lead">Redis-backed distributed mutexes and connection semaphores, plus wait-for graph deadlock detection.</p>
+          </div>
+        </div>
+        <div class="grid grid-2">
+          <div class="card">
+            <h2 class="card-title">Regional mutex</h2>
+            <form id="lock-form" class="form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label for="lock-region">Region</label>
+                  <select id="lock-region"><option value="us">US</option><option value="eu">EU</option><option value="asia">ASIA</option></select>
+                </div>
+                <div class="field">
+                  <label for="lock-client">Client ID</label>
+                  <input id="lock-client" type="text" value="console-1" maxlength="64" required autocomplete="off" aria-describedby="lock-client-error">
+                  <p class="error-text" id="lock-client-error" hidden></p>
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary" value="acquire">Acquire</button>
+                <button type="submit" class="btn btn-secondary" value="release">Release</button>
+              </div>
+            </form>
+            <div id="lock-msg" aria-live="polite"></div>
+            <div id="lock-table"></div>
+          </div>
+
+          <div class="card">
+            <h2 class="card-title">Connection semaphore</h2>
+            <form id="sem-form" class="form" novalidate>
+              <div class="form-row">
+                <div class="field">
+                  <label for="sem-region">Region</label>
+                  <select id="sem-region"><option value="us">US</option><option value="eu">EU</option><option value="asia">ASIA</option></select>
+                </div>
+                <div class="field field-end">
+                  <button type="submit" class="btn btn-primary btn-block">Take a slot</button>
+                </div>
+              </div>
+            </form>
+            <div id="sem-meter" aria-live="polite"></div>
+            <div id="sem-msg" aria-live="polite"></div>
+            <div id="sem-held"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">Deadlock detection</h2>
+              <p class="meta">Inject a three-way cycle (US → EU → ASIA → US) into the wait-for graph, then detect it.</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn btn-secondary" id="dl-simulate" data-admin>Inject cycle</button>
+              <button type="button" class="btn btn-primary" id="dl-check">Detect</button>
+            </div>
+          </div>
+          <div id="dl-result" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <!-- =============================================================== Queue -->
+      <section class="view" data-view="queue" aria-labelledby="h-queue" hidden>
+        <div class="view-head">
+          <div>
+            <h1 id="h-queue">Work queue</h1>
+            <p class="lead">A bounded producer–consumer queue in Redis. When it is full, producers get HTTP 429 back-pressure.</p>
+          </div>
+          <div class="view-actions">
+            <button type="button" class="btn btn-secondary" id="queue-consumers" data-admin>Add 2 consumers</button>
+          </div>
+        </div>
+        <div class="grid grid-2">
+          <div class="card">
+            <h2 class="card-title">Produce a job</h2>
+            <form id="queue-form" class="form" novalidate>
+              <div class="field">
+                <label for="queue-action">Action</label>
+                <input id="queue-action" type="text" value="send_welcome_email" maxlength="64" required autocomplete="off" aria-describedby="queue-action-error">
+                <p class="error-text" id="queue-action-error" hidden></p>
+              </div>
+              <div class="field">
+                <label for="queue-payload">Payload <span class="optional">(JSON object)</span></label>
+                <textarea id="queue-payload" rows="4" spellcheck="false" class="mono" aria-describedby="queue-payload-error">{"user_id": 1}</textarea>
+                <p class="error-text" id="queue-payload-error" hidden></p>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Enqueue</button>
+                <div class="inline-form">
+                  <label for="queue-burst">Burst</label>
+                  <select id="queue-burst"><option value="1">×1</option><option value="10">×10</option><option value="60">×60</option></select>
+                </div>
+              </div>
+            </form>
+            <div id="queue-msg" aria-live="polite"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2 class="card-title">Queue stats</h2>
+              <button type="button" class="btn btn-ghost btn-sm" id="queue-refresh">Refresh</button>
+            </div>
+            <div id="queue-stats" aria-live="polite"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================================ Not found -->
+      <section class="view" data-view="not-found" aria-labelledby="h-nf" hidden>
+        <div class="empty empty-lg">
+          <p class="empty-code" aria-hidden="true">404</p>
+          <h1 id="h-nf">This page doesn't exist</h1>
+          <p>The console section you asked for isn't here. It may have been renamed.</p>
+          <a class="btn btn-primary" href="#/overview">Back to overview</a>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="admin-dialog" aria-labelledby="admin-dialog-title">
+    <form method="dialog" id="admin-key-form" class="form">
+      <h2 id="admin-dialog-title" class="card-title">Admin API key</h2>
+      <p class="meta">Cache flush, index rebuild, deadlock injection and consumer scaling need the server's <code>ADMIN_API_KEY</code> when it is set. The key stays in this browser tab only.</p>
+      <div class="field">
+        <label for="admin-key-input">X-API-Key</label>
+        <input id="admin-key-input" type="password" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="form-actions form-actions-end">
+        <button type="button" class="btn btn-ghost" id="admin-key-clear">Clear</button>
+        <button type="button" class="btn btn-secondary" id="admin-key-cancel">Cancel</button>
+        <button type="submit" class="btn btn-primary" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <noscript><p class="noscript">The console needs JavaScript. The raw API is available at <a href="/docs">/docs</a>.</p></noscript>
+</body>
+</html>
