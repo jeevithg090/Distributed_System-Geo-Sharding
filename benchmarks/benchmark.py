@@ -1,75 +1,49 @@
-import psycopg2
-import time
-import statistics
+"""Per-shard point-query latency, opening a new connection for every query.
+
+The measured time includes the TCP + authentication handshake, which is what
+``pooled_benchmark`` removes. Run with ``python -m benchmarks.benchmark``.
+"""
+
+from __future__ import annotations
+
+import argparse
 import random
+import time
 
-DATABASES = {
-    "us": 5433,
-    "eu": 5434,
-    "asia": 5435
-}
-
-
-def run_query(region, port):
-
-    conn = psycopg2.connect(
-        host="localhost",
-        port=port,
-        database="sharddb",
-        user="admin",
-        password="password"
-    )
-
-    cursor = conn.cursor()
-
-    user_id = random.randint(1, 500)
-
-    start = time.time()
-
-    cursor.execute("""
-        SELECT *
-        FROM users
-        WHERE user_id = %s
-    """, (user_id,))
-
-    cursor.fetchone()
-
-    end = time.time()
-
-    latency_ms = (end - start) * 1000
-
-    cursor.close()
-    conn.close()
-
-    return latency_ms
+from benchmarks._common import POINT_QUERY, random_user_id
+from benchmarks.stats import format_summary
+from core.config import REGIONS
+from core.db import connect
 
 
-for region, port in DATABASES.items():
+def run(iterations: int, seed: int | None = None) -> dict[str, list[float]]:
+    rng = random.Random(seed)
+    results: dict[str, list[float]] = {}
+    for region in REGIONS:
+        samples = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            conn = connect(region)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(POINT_QUERY, (random_user_id(region, rng),))
+                    cur.fetchone()
+            finally:
+                conn.close()
+            samples.append((time.perf_counter() - start) * 1000)
+        results[region] = samples
+    return results
 
-    latencies = []
 
-    print(f"\nRunning benchmark for {region.upper()} shard...")
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-n", "--iterations", type=int, default=50)
+    parser.add_argument("--seed", type=int)
+    args = parser.parse_args()
+    print(f"Unpooled point queries ({args.iterations} per shard, connect + query + close)")
+    for region, samples in run(args.iterations, args.seed).items():
+        print(format_summary(region.upper(), samples))
 
-    for _ in range(50):
 
-        latency = run_query(region, port)
-
-        latencies.append(latency)
-
-    min_latency = min(latencies)
-    max_latency = max(latencies)
-    avg_latency = statistics.mean(latencies)
-
-    p95_latency = statistics.quantiles(
-        latencies,
-        n=100
-    )[94]
-
-    print(f"""
-Region: {region.upper()}
--------------------------
-Min:  {min_latency:.2f} ms
-Avg:  {avg_latency:.2f} ms
-P95:  {p95_latency:.2f} ms
-Max:  {max_latency:.2f} ms
-""")
+if __name__ == "__main__":
+    main()
